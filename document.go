@@ -36,16 +36,16 @@ type measure struct {
 	selections set[string]
 }
 
-type retain struct {
+type retainOp struct {
 	_text string
 }
 
-type delete struct {
+type deleteOp struct {
 	_text string
 	// could put a pointer to a "move" operation here if text has moved
 }
 
-type insert struct {
+type insertOp struct {
 	peer  string // used for ordering
 	_text string
 }
@@ -123,43 +123,43 @@ func (m opMeasurer) Sum(a measure, b measure) measure {
 /// operations
 ///
 
-func (r *retain) String() string {
+func (r *retainOp) String() string {
 	return r._text
 }
 
-func (r *retain) opString(offset int) string {
+func (r *retainOp) opString(offset int) string {
 	return fmt.Sprintf("retain(%d, '%s')", offset, r._text)
 }
 
-func (r *retain) text() string {
+func (r *retainOp) text() string {
 	return r._text
 }
 
-func (r *retain) measure() measure {
+func (r *retainOp) measure() measure {
 	return measure{oldLen: len(r._text), newLen: len(r._text)}
 }
 
-func (r *retain) merge(doc *document, offset int) {
+func (r *retainOp) merge(doc *document, offset int) {
 	// ignore this, it doesn't change the doc
 }
 
-func (d *delete) String() string {
+func (d *deleteOp) String() string {
 	return ""
 }
 
-func (d *delete) opString(offset int) string {
+func (d *deleteOp) opString(offset int) string {
 	return fmt.Sprintf("delete(%d, %d)", offset, len(d._text))
 }
 
-func (d *delete) text() string {
+func (d *deleteOp) text() string {
 	return d._text
 }
 
-func (d *delete) measure() measure {
+func (d *deleteOp) measure() measure {
 	return measure{oldLen: len(d._text)}
 }
 
-func (d *delete) merge(doc *document, offset int) {
+func (d *deleteOp) merge(doc *document, offset int) {
 	left, right := splitOld(doc.ops, offset)
 	for {
 		if right.IsEmpty() {
@@ -167,32 +167,32 @@ func (d *delete) merge(doc *document, offset int) {
 			return
 		}
 		switch first := right.PeekFirst().(type) {
-		case *delete:
+		case *deleteOp:
 			if len(first._text) >= len(d._text) {
 				// same text has already been deleted
 				return
 			}
 			// doc has deleted the first part of this text, continue with rest of delete
-			d = &delete{d._text[len(first._text):]}
+			d = &deleteOp{d._text[len(first._text):]}
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
 			// make another pass through the loop
-		case *retain:
+		case *retainOp:
 			// remove the retain
 			right = right.RemoveFirst()
 			if len(first._text) >= len(d._text) {
 				// the entire deleted text is still in the doc, add the deletion
 				if len(first._text) > len(d._text) {
 					// keep any remaining retained text
-					right = right.AddFirst(&retain{first._text[len(d._text):]})
+					right = right.AddFirst(&retainOp{first._text[len(d._text):]})
 				}
 				doc.ops = left.AddLast(d).Concat(right)
 				return
 			}
 			// the first part of the deletion is still in the doc
-			left = left.AddLast(&delete{d._text[:len(first._text)]})
+			left = left.AddLast(&deleteOp{d._text[:len(first._text)]})
 			// continue with rest of delete
-			d = &delete{d._text[len(first._text):]}
+			d = &deleteOp{d._text[len(first._text):]}
 			// make another pass through the loop
 		default:
 			// an insert or selection should not be the first right operation
@@ -201,23 +201,23 @@ func (d *delete) merge(doc *document, offset int) {
 	}
 }
 
-func (i *insert) String() string {
+func (i *insertOp) String() string {
 	return i._text
 }
 
-func (i *insert) opString(offset int) string {
+func (i *insertOp) opString(offset int) string {
 	return fmt.Sprintf("insert[%s](%d, '%s')", i.peer, offset, i._text)
 }
 
-func (i *insert) text() string {
+func (i *insertOp) text() string {
 	return i._text
 }
 
-func (i *insert) measure() measure {
+func (i *insertOp) measure() measure {
 	return measure{newLen: len(i._text)}
 }
 
-func (i *insert) merge(doc *document, offset int) {
+func (i *insertOp) merge(doc *document, offset int) {
 	// splitOld returns the first right as a retain or delete
 	// push any trailing inserts onto the right
 	left, right := shiftInsertsRight(splitOld(doc.ops, offset))
@@ -227,7 +227,7 @@ func (i *insert) merge(doc *document, offset int) {
 			return
 		}
 		switch first := right.PeekFirst().(type) {
-		case *insert:
+		case *insertOp:
 			if i.peer < first.peer {
 				doc.ops = left.AddLast(i).Concat(right)
 				return
@@ -235,14 +235,14 @@ func (i *insert) merge(doc *document, offset int) {
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
 			// make another pass through the loop
-		case *retain:
+		case *retainOp:
 			doc.ops = left.AddLast(i).Concat(right)
 			return
-		case *delete:
+		case *deleteOp:
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
 			// make another pass through the loop
-		case *selection:
+		case *selectionOp:
 			doc.ops = left.AddLast(i).Concat(right)
 			return
 		default:
@@ -251,23 +251,23 @@ func (i *insert) merge(doc *document, offset int) {
 	}
 }
 
-func (s *selection) String() string {
+func (s *selectionOp) String() string {
 	return ""
 }
 
-func (s *selection) opString(offset int) string {
+func (s *selectionOp) opString(offset int) string {
 	return fmt.Sprintf("selection(%d, %d)", offset, s.len)
 }
 
-func (s *selection) text() string {
+func (s *selectionOp) text() string {
 	return ""
 }
 
-func (s *selection) measure() measure {
+func (s *selectionOp) measure() measure {
 	return measure{selections: newSet(s)}
 }
 
-func (s *selection) merge(doc *document, offset int) {
+func (s *selectionOp) merge(doc *document, offset int) {
 	left, right := splitOld(doc.ops, offset)
 	for {
 		if right.IsEmpty() {
@@ -275,10 +275,10 @@ func (s *selection) merge(doc *document, offset int) {
 			return
 		}
 		switch first := right.PeekFirst().(type) {
-		case *insert, *delete:
+		case *insertOp, *deleteOp:
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
-		case *retain, *selection:
+		case *retainOp, *selectionOp:
 			doc.ops = left.AddLast(s).Concat(right)
 		}
 	}
@@ -299,7 +299,7 @@ func newDocument(peer string, text ...string) *document {
 		for _, t := range text {
 			fmt.Fprint(sb, t)
 		}
-		ops = newOpTree(&retain{sb.String()})
+		ops = newOpTree(&retainOp{sb.String()})
 	} else {
 		ops = newOpTree()
 	}
@@ -354,10 +354,10 @@ func splitOld(tree opTree, offset int) (opTree, opTree) {
 		// not a clean break, if the first right element is a retain, it needs to be split
 		// otherwise it is a delete and should remain on the right
 		switch first := right.PeekFirst().(type) {
-		case *retain:
-			left = left.AddLast(&retain{first._text[:splitPoint]})
-			right = right.RemoveFirst().AddFirst(&retain{first._text[splitPoint:]})
-		case *delete:
+		case *retainOp:
+			left = left.AddLast(&retainOp{first._text[:splitPoint]})
+			right = right.RemoveFirst().AddFirst(&retainOp{first._text[splitPoint:]})
+		case *deleteOp:
 			// leave it on the right
 		default:
 			panic(fmt.Errorf("bad value at split point %d: %v", splitPoint, first))
@@ -380,12 +380,12 @@ func splitNew(tree opTree, offset int) (opTree, opTree) {
 		first := right.PeekFirst()
 		right = right.RemoveFirst()
 		switch first := first.(type) {
-		case *retain:
-			left = left.AddLast(&retain{first._text[:splitPoint]})
-			right = right.AddFirst(&retain{first._text[splitPoint:]})
-		case *insert:
-			left = left.AddLast(&insert{first.peer, first._text[:splitPoint]})
-			right = right.AddFirst(&insert{first.peer, first._text[splitPoint:]})
+		case *retainOp:
+			left = left.AddLast(&retainOp{first._text[:splitPoint]})
+			right = right.AddFirst(&retainOp{first._text[splitPoint:]})
+		case *insertOp:
+			left = left.AddLast(&insertOp{first.peer, first._text[:splitPoint]})
+			right = right.AddFirst(&insertOp{first.peer, first._text[splitPoint:]})
 		default:
 			panic(fmt.Errorf("bad value at split point %d: %v", splitPoint, first))
 		}
@@ -404,10 +404,10 @@ func shiftInsertsRight(left opTree, right opTree) (opTree, opTree) {
 	found := false
 	for !l.IsEmpty() {
 		switch op := l.PeekLast().(type) {
-		case *selection, *insert:
+		case *selectionOp, *insertOp:
 			l = l.RemoveLast()
 			r = r.AddFirst(op)
-			found = found || isa[*insert](op)
+			found = found || isa[*insertOp](op)
 			continue
 		}
 		break
@@ -424,10 +424,10 @@ func shiftDeletesRight(left opTree, right opTree) (opTree, opTree) {
 	found := false
 	for !l.IsEmpty() {
 		switch op := l.PeekLast().(type) {
-		case *selection, *delete:
+		case *selectionOp, *deleteOp:
 			l = l.RemoveLast()
 			r = r.AddFirst(op)
-			found = found || isa[*delete](op)
+			found = found || isa[*deleteOp](op)
 			continue
 		}
 		break
@@ -448,7 +448,7 @@ func (d *document) replace(start int, length int, str string) {
 		left, mid = shiftDeletesRight(left, mid)
 		if !mid.IsEmpty() {
 			// there will only be one delete
-			del, _ := mid.PeekFirst().(*delete)
+			del, _ := mid.PeekFirst().(*deleteOp)
 			fmt.Fprint(sb, del._text)
 			mid = mid.RemoveFirst()
 		}
@@ -456,10 +456,10 @@ func (d *document) replace(start int, length int, str string) {
 		del, right = splitNew(right, length)
 		del.Each(func(v operation) bool {
 			switch o := v.(type) {
-			case *retain, *delete:
+			case *retainOp, *deleteOp:
 				// coalesce retains and deletes into a single delete
 				fmt.Fprint(sb, o.text())
-			case *insert:
+			case *insertOp:
 				// chuck inserts
 			default:
 				// gather selections after the delete
@@ -469,15 +469,15 @@ func (d *document) replace(start int, length int, str string) {
 		})
 		if !right.IsEmpty() {
 			switch del := right.PeekFirst().(type) {
-			case *delete:
+			case *deleteOp:
 				fmt.Fprint(sb, del._text)
 				right = right.RemoveFirst()
 			}
 		}
-		left = left.AddLast(&delete{sb.String()}).Concat(mid)
+		left = left.AddLast(&deleteOp{sb.String()}).Concat(mid)
 	}
 	if len(str) > 0 {
-		right = right.AddFirst(&insert{d.peer, str})
+		right = right.AddFirst(&insertOp{d.peer, str})
 	}
 	d.ops = left.Concat(right)
 }
