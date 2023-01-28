@@ -16,8 +16,7 @@ type set[T comparable] map[T]bool
 type opTree = ft.FingerTree[opMeasurer, operation, measure]
 
 type document struct {
-	peer string
-	ops  opTree
+	ops opTree
 }
 
 type opMeasurer bool
@@ -31,9 +30,9 @@ type operation interface {
 }
 
 type measure struct {
-	oldLen     int
-	newLen     int
-	selections set[string]
+	oldLen  int
+	newLen  int
+	markers set[string]
 }
 
 type retainOp struct {
@@ -50,8 +49,8 @@ type insertOp struct {
 	_text string
 }
 
-type selection struct {
-	len int
+type markerOp struct {
+	name string
 }
 
 ///
@@ -113,9 +112,9 @@ func (m opMeasurer) Measure(op operation) measure {
 
 func (m opMeasurer) Sum(a measure, b measure) measure {
 	return measure{
-		oldLen:     a.oldLen + b.oldLen,
-		newLen:     a.newLen + b.newLen,
-		selections: a.selections.union(b.selections),
+		oldLen:  a.oldLen + b.oldLen,
+		newLen:  a.newLen + b.newLen,
+		markers: a.markers.union(b.markers),
 	}
 }
 
@@ -242,7 +241,7 @@ func (i *insertOp) merge(doc *document, offset int) {
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
 			// make another pass through the loop
-		case *selectionOp:
+		case *markerOp:
 			doc.ops = left.AddLast(i).Concat(right)
 			return
 		default:
@@ -251,23 +250,23 @@ func (i *insertOp) merge(doc *document, offset int) {
 	}
 }
 
-func (s *selectionOp) String() string {
+func (s *markerOp) String() string {
 	return ""
 }
 
-func (s *selectionOp) opString(offset int) string {
-	return fmt.Sprintf("selection(%d, %d)", offset, s.len)
+func (s *markerOp) opString(offset int) string {
+	return fmt.Sprintf("marker(%s, %d)", s.name, offset)
 }
 
-func (s *selectionOp) text() string {
+func (s *markerOp) text() string {
 	return ""
 }
 
-func (s *selectionOp) measure() measure {
-	return measure{selections: newSet(s)}
+func (s *markerOp) measure() measure {
+	return measure{markers: newSet(s.name)}
 }
 
-func (s *selectionOp) merge(doc *document, offset int) {
+func (s *markerOp) merge(doc *document, offset int) {
 	left, right := splitOld(doc.ops, offset)
 	for {
 		if right.IsEmpty() {
@@ -278,7 +277,7 @@ func (s *selectionOp) merge(doc *document, offset int) {
 		case *insertOp, *deleteOp:
 			left = left.AddLast(first)
 			right = right.RemoveFirst()
-		case *retainOp, *selectionOp:
+		case *retainOp, *markerOp:
 			doc.ops = left.AddLast(s).Concat(right)
 		}
 	}
@@ -292,7 +291,7 @@ func newOpTree(ops ...operation) opTree {
 	return ft.FromArray[opMeasurer, operation, measure](opMeasurer(true), ops)
 }
 
-func newDocument(peer string, text ...string) *document {
+func newDocument(text ...string) *document {
 	sb := &strings.Builder{}
 	var ops opTree
 	if len(text) > 0 {
@@ -304,9 +303,17 @@ func newDocument(peer string, text ...string) *document {
 		ops = newOpTree()
 	}
 	return &document{
-		peer: peer,
-		ops:  ops,
+		ops: ops,
 	}
+}
+
+func (d *document) Copy() *document {
+	d2 := *d
+	return &d2
+}
+
+func (d *document) Freeze() *document {
+	return newDocument(d.String())
 }
 
 // print the new document
@@ -398,13 +405,13 @@ func isa[T any](v any) bool {
 	return ok
 }
 
-// if left ends in inserts and (optionally) selections, shift them to right
+// if left ends in inserts and (optionally) markers, shift them to right
 func shiftInsertsRight(left opTree, right opTree) (opTree, opTree) {
 	l, r := left, right
 	found := false
 	for !l.IsEmpty() {
 		switch op := l.PeekLast().(type) {
-		case *selectionOp, *insertOp:
+		case *markerOp, *insertOp:
 			l = l.RemoveLast()
 			r = r.AddFirst(op)
 			found = found || isa[*insertOp](op)
@@ -418,13 +425,13 @@ func shiftInsertsRight(left opTree, right opTree) (opTree, opTree) {
 	return left, right
 }
 
-// if left ends in deletes and (optionally) selections, shift them to right
+// if left ends in deletes and (optionally) markers, shift them to right
 func shiftDeletesRight(left opTree, right opTree) (opTree, opTree) {
 	l, r := left, right
 	found := false
 	for !l.IsEmpty() {
 		switch op := l.PeekLast().(type) {
-		case *selectionOp, *deleteOp:
+		case *markerOp, *deleteOp:
 			l = l.RemoveLast()
 			r = r.AddFirst(op)
 			found = found || isa[*deleteOp](op)
@@ -438,12 +445,38 @@ func shiftDeletesRight(left opTree, right opTree) (opTree, opTree) {
 	return left, right
 }
 
-func (d *document) replace(start int, length int, str string) {
+func removeMarker(tree opTree, name string) opTree {
+	left, right := splitOnMarker(tree, name)
+	if !right.IsEmpty() {
+		tree = left.Concat(right.RemoveFirst())
+	}
+	return tree
+}
+
+// set the selection for peer
+func (d *document) selection(peer string, start int, length int) {
+	// remove old selection for peer if there is one
+	tree := removeMarker(d.ops, selectionStart(peer))
+	tree = removeMarker(d.ops, selectionEnd(peer))
+	left, right := tree.Split(func(m measure) bool {
+		return m.newLen > start
+	})
+	mid, end := right.Split(func(m measure) bool {
+		return m.newLen > length
+	})
+	d.ops = left.
+		AddLast(&markerOp{selectionStart(peer)}).
+		Concat(mid).
+		AddLast(&markerOp{selectionEnd(peer)}).
+		Concat(end)
+}
+
+func (d *document) replace(peer string, start int, length int, str string) {
 	// the left mid value should be a string if mid is nonempty
 	left, right := splitNew(d.ops, start)
 	if length > 0 {
 		sb := &strings.Builder{}
-		// gather deletes at the end of left, followed by selections
+		// gather deletes at the end of left, followed by markers
 		mid := newOpTree()
 		left, mid = shiftDeletesRight(left, mid)
 		if !mid.IsEmpty() {
@@ -462,7 +495,7 @@ func (d *document) replace(start int, length int, str string) {
 			case *insertOp:
 				// chuck inserts
 			default:
-				// gather selections after the delete
+				// gather markers after the delete
 				mid.AddLast(o)
 			}
 			return true
@@ -477,7 +510,7 @@ func (d *document) replace(start int, length int, str string) {
 		left = left.AddLast(&deleteOp{sb.String()}).Concat(mid)
 	}
 	if len(str) > 0 {
-		right = right.AddFirst(&insertOp{d.peer, str})
+		right = right.AddFirst(&insertOp{peer, str})
 	}
 	d.ops = left.Concat(right)
 }
@@ -490,4 +523,74 @@ func (a *document) merge(b *document) {
 		offset += op.measure().oldLen
 		return true
 	})
+}
+
+func splitOnMarker(tree opTree, name string) (opTree, opTree) {
+	return tree.Split(func(m measure) bool {
+		return m.markers.has(name)
+	})
+}
+
+func selectionStart(peer string) string {
+	return fmt.Sprint(peer, ".sel.start")
+}
+
+func selectionEnd(peer string) string {
+	return fmt.Sprint(peer, ".sel.end")
+}
+
+func (d *document) splitOnMarker(name string) (opTree, opTree) {
+	return splitOnMarker(d.ops, name)
+}
+
+func (d *document) getSelection(peer string) (int, int) {
+	left, right := d.splitOnMarker(selectionStart(peer))
+	if _, ok := right.PeekFirst().(*markerOp); ok {
+		mid, end := d.splitOnMarker(selectionEnd(peer))
+		if _, ok := end.PeekFirst().(*markerOp); ok {
+			return left.Measure().newLen, mid.Measure().newLen
+		}
+	}
+	return 0, 0
+}
+
+// append edits that restore the original document
+func (d *document) reverseEdits() []Replacement {
+	edits := make([]Replacement, 0, 8)
+	docLen := d.ops.Measure().newLen
+	d.ops.EachReverse(func(op operation) bool {
+		width := op.measure().newLen
+		switch op := op.(type) {
+		case *deleteOp:
+			edits = append(edits, Replacement{Offset: docLen, Length: 0, Text: op._text})
+		case *insertOp:
+			edits = append(edits, Replacement{Offset: docLen - width, Length: len(op._text), Text: ""})
+		}
+		docLen -= width
+		return true
+	})
+	return edits
+}
+
+// append edits that restore the original document
+func (d *document) edits() []Replacement {
+	edits := make([]Replacement, 0, 8)
+	offset := 0
+	d.ops.Each(func(op operation) bool {
+		switch op := op.(type) {
+		case *deleteOp:
+			edits = append(edits, Replacement{Offset: offset, Length: len(op._text), Text: ""})
+		case *insertOp:
+			edits = append(edits, Replacement{Offset: offset, Length: 0, Text: op._text})
+		}
+		offset += op.measure().newLen
+		return true
+	})
+	return edits
+}
+
+func (d *document) apply(peer string, edits []Replacement) {
+	for _, repl := range edits {
+		d.replace(peer, repl.Offset, repl.Offset, repl.Text)
+	}
 }
