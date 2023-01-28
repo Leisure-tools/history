@@ -28,12 +28,7 @@ type Session struct {
 	pendingOps    []*Replacement
 	lcas          map[twosha]*LCA
 	blockOrder    []sha
-	//checkpoints   map[sha]*lcaContent // latest checkpoint for a block hash or peer hash
 }
-
-//type lcaContent struct {
-//	content string
-//}
 
 type DocStorage interface {
 	EachBlockHash(func(sha))
@@ -43,7 +38,6 @@ type DocStorage interface {
 	HasBlock(hash sha) bool
 	StorePendingBlock(*OpBlock)
 	GetPendingBlocks() []*OpBlock
-	//StoreLcaContent(chp *lcaContent)
 	StoreParameters(latest map[string]sha, pendingOps []*Replacement)
 	Pending(blk sha)
 	PendingOn(blk sha, pendingBlock sha)
@@ -66,10 +60,9 @@ type OpBlock struct {
 	document         *document // simple cache to speed up successive document edits
 	documentAncestor sha
 	blockDoc         *document // frozen document for this block
-	//cp               *lcaContent // cached at each LCA
-	children    []sha
-	descendants set[sha]
-	order       int // block's index in the session's blockOrder list
+	children         []sha
+	descendants      set[sha]
+	order            int // block's index in the session's blockOrder list
 }
 
 type LCA struct {
@@ -90,7 +83,6 @@ type Replacement struct {
 type MemoryStorage struct {
 	blocks        map[sha]*OpBlock
 	pendingBlocks map[sha]*OpBlock
-	//checkpoints   map[sha]*lcaContent
 }
 
 ///
@@ -134,10 +126,6 @@ func (st *MemoryStorage) HasBlock(hash sha) bool {
 func (st *MemoryStorage) StoreBlock(blk *OpBlock) {
 	st.blocks[blk.Hash] = blk
 }
-
-//func (st *MemoryStorage) StoreLcaContent(chp *lcaContent) {
-//	st.checkpoints[chp.hash()] = chp
-//}
 
 func (st *MemoryStorage) StoreParameters(latest map[string]sha, pendingOps []*Replacement) {
 }
@@ -192,16 +180,6 @@ func (blk *OpBlock) computeHash() {
 		blk.Hash = hash
 	}
 }
-
-//func (blk *OpBlock) computeOrder(s *Session) {
-//	for _, hash := range blk.Parents {
-//		if s.getBlock(hash).order == len(s.blocks)-1 {
-//			blk.order = len(s.blocks)
-//			return
-//		}
-//	}
-//	s.recomputeOrder()
-//}
 
 func (blk *OpBlock) addToDescendants(s *Session, descendant sha, seen set[sha]) {
 	if seen.has(blk.Hash) {
@@ -292,36 +270,6 @@ func (blk *OpBlock) checkPending(s *Session) {
 	}
 }
 
-//func (blk *OpBlock) recentCheckpoint(s *Session) *lcaContent {
-//	//for blk != nil {
-//	//	if ch := s.checkpoints[blk.Hash]; ch != nil {
-//	//		return ch
-//	//	}
-//	//	blk = s.getBlock(blk.PrevHash)
-//	//}
-//	return s.checkpoints[sha{}]
-//}
-
-//func (blk *OpBlock) prev(s *Session) *OpBlock {
-//	return s.getBlock(blk.PrevHash)
-//}
-
-//func (blk *OpBlock) blocksAfter(s *Session, chp *checkpoint) []*OpBlock {
-//	blocks := make([]*OpBlock, 0, 8)
-//	for blk != nil {
-//		if (chp.hashes[blk.Peer] != sha{}) {
-//			break
-//		}
-//		blocks = append(blocks, blk)
-//		blk = blk.prev(s)
-//	}
-//	return blocks
-//}
-
-//func (blk *OpBlock) addChild(hash sha) {
-//	blk.children = append(blk.children, hash)
-//}
-
 func (blk *OpBlock) computeBlockDoc(s *Session) *document {
 	if blk.document != nil {
 		return blk.document
@@ -337,48 +285,6 @@ func (blk *OpBlock) apply(doc *document) {
 		doc.replace(blk.Peer, op.Offset, op.Length, op.Text)
 	}
 }
-
-// compute a document starting from a checkpoint
-//func (blk *OpBlock) docFrom(s *Session, chp *checkpoint) *document {
-//	blocks := blk.blocksAfter(s, chp)
-//	doc := newDocument(chp.content)
-//	for i := len(blocks) - 1; i >= 0; i-- {
-//		blocks[i].apply(doc)
-//	}
-//	return doc
-//}
-
-///
-/// checkpoint
-///
-
-//func newCheckpoint(s *Session, hashes map[string]sha, content string) *lcaContent {
-//	return &lcaContent{
-//		//hashes:  hashes,
-//		content: content,
-//		//serial:  len(s.checkpoints),
-//	}
-//}
-
-//func (chp *checkpoint) has(blk *OpBlock) bool {
-//	for _, hash := range chp.hashes {
-//		if hash == blk.Hash {
-//			return true
-//		}
-//	}
-//	return false
-//}
-
-//func (chp *checkpoint) hash() sha {
-//	hashes := make([]sha, len(chp.hashes))
-//	pos := 0
-//	for peer := range chp.hashes {
-//		hashes[pos] = chp.hashes[peer]
-//		pos++
-//	}
-//	sortHashes(hashes)
-//	return hashHash(hashes)
-//}
 
 ///
 /// LCA
@@ -554,56 +460,6 @@ func hashHash(hashes []sha) sha {
 	return sha256.Sum256([]byte(hashDoc.String()))
 }
 
-//// return whether there has been incoming activity since the last checkpoint
-//func (s *Session) hasActivity() bool {
-//	return s.checkpoints[hashHash(s.latestHashes())] == nil
-//}
-
-// produce a document from an ancestor by merging in edits from blocks
-//func (s *Session) docFromCheckpoint(ancestor *checkpoint, blocks []*OpBlock) *document {
-//	content := s.base
-//	if ancestor != nil {
-//		content = ancestor.content
-//	}
-//	doc := newDocument(content)
-//	for _, blk := range blocks {
-//		if ancestor != nil && ancestor.has(blk) {
-//			continue
-//		}
-//		doc.merge(blk.docFrom(s, ancestor))
-//	}
-//	return doc
-//}
-
-// compute a new checkpoint if there has been any activity
-// return the checkpoint and a document containing edits from the previous checkpoint
-//func (s *Session) checkpoint() (*checkpoint, *document) {
-//	if ch := s.checkpoints[hashHash(s.chainHashes(true))]; ch != nil {
-//		// no activity
-//		return nil, nil
-//	}
-//	ancestor := s.chains[s.peer].recentCheckpoint(s)
-//	blocks := make([]*OpBlock, 0, len(s.chains))
-//	for _, blk := range s.chains {
-//		blocks = append(blocks, blk)
-//	}
-//	doc := s.docFromCheckpoint(ancestor, blocks)
-//	cpHashes := map[string]sha{}
-//	chp := newCheckpoint(s, cpHashes, doc.String())
-//	s.checkpoints[hashHash(s.chainHashes(true))] = chp
-//	for peer := range s.peers {
-//		cpHashes[peer] = s.chains[peer].Hash
-//		s.checkpoints[s.chains[peer].Hash] = chp
-//	}
-//	s.storage.StoreCheckpoint(chp)
-//	s.pruneBefore(ancestor)
-//	return ancestor, doc
-//}
-
-//// remove blocks before checkpoint from memory
-//func (s *Session) pruneBefore(chp *lcaContent) {
-//}
-
 // add a replacement to pendingOps
 func (s *Session) Replace(offset int, length int, text string) {
 	s.pendingOps = append(s.pendingOps, &Replacement{offset, length, text})
@@ -685,15 +541,6 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 	}
 	return s.edits(blk)
 }
-
-//func (s *Session) UpdateLatest() []*OpBlock {
-//	ops := make([]*OpBlock, 0, 8)
-//	for blk := s.latest; blk != nil; blk = s.getBlock(s.nextBlock[blk.Hash]) {
-//		ops = append(ops, blk)
-//	}
-//	s.latest = ops[len(ops)-1]
-//	return ops
-//}
 
 func Apply(str string, repl []Replacement) string {
 	sb := &strings.Builder{}
