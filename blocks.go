@@ -22,23 +22,22 @@ type Session struct {
 	source        sha
 	latest        map[string]*OpBlock // peer -> block
 	blocks        map[sha]*OpBlock
-	pendingOn     map[sha][]*OpBlock
+	pendingOn     map[sha]set[*OpBlock]
 	pendingBlocks map[sha]*OpBlock
 	storage       DocStorage
-	pendingOps    []*Replacement
-	lcas          map[twosha]*LCA
+	pendingOps    []Replacement
+	lcas          map[twosha]*LCA // 2-block LCAs
 	blockOrder    []sha
 }
 
 type DocStorage interface {
-	EachBlockHash(func(sha))
 	HasPendingBlock(hash sha) bool
 	StoreBlock(blk *OpBlock) // removes from pending
 	GetBlock(hash sha) *OpBlock
 	HasBlock(hash sha) bool
 	StorePendingBlock(*OpBlock)
 	GetPendingBlocks() []*OpBlock
-	StoreParameters(latest map[string]sha, pendingOps []*Replacement)
+	StoreParameters(latest map[string]sha, pendingOps []Replacement)
 	Pending(blk sha)
 	PendingOn(blk sha, pendingBlock sha)
 	Dirty(blk *OpBlock)
@@ -66,7 +65,7 @@ type OpBlock struct {
 }
 
 type LCA struct {
-	blkA     sha
+	blkA     sha // blkA.order < blkB.order
 	orderA   int
 	blkB     sha
 	orderB   int
@@ -91,12 +90,6 @@ type MemoryStorage struct {
 
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{map[sha]*OpBlock{}, map[sha]*OpBlock{}}
-}
-
-func (st MemoryStorage) EachBlockHash(fn func(sha)) {
-	for hash := range st.blocks {
-		fn(hash)
-	}
 }
 
 func (st *MemoryStorage) GetBlock(hash sha) *OpBlock {
@@ -127,7 +120,7 @@ func (st *MemoryStorage) StoreBlock(blk *OpBlock) {
 	st.blocks[blk.Hash] = blk
 }
 
-func (st *MemoryStorage) StoreParameters(latest map[string]sha, pendingOps []*Replacement) {
+func (st *MemoryStorage) StoreParameters(latest map[string]sha, pendingOps []Replacement) {
 }
 
 func (st *MemoryStorage) Dirty(blk *OpBlock) {}
@@ -255,14 +248,14 @@ func (blk *OpBlock) checkPending(s *Session) {
 			if !s.hasBlock(hash) {
 				pending = true
 				if s.pendingOn[hash] == nil {
-					s.pendingOn[hash] = make([]*OpBlock, 0, 8)
+					s.pendingOn[hash] = set[*OpBlock]{}
 				}
-				s.pendingOn[hash] = append(s.pendingOn[hash], blk)
+				s.pendingOn[hash].add(blk)
 			}
 		}
 		if !pending {
 			s.addBlock(blk)
-			for _, blk := range s.pendingOn[blk.Hash] {
+			for blk := range s.pendingOn[blk.Hash] {
 				blk.checkPending(s)
 			}
 			delete(s.pendingOn, blk.Hash)
@@ -270,20 +263,41 @@ func (blk *OpBlock) checkPending(s *Session) {
 	}
 }
 
-func (blk *OpBlock) computeBlockDoc(s *Session) *document {
-	if blk.document != nil {
-		return blk.document
-	}
-	//blk.document = s.mergeBlocks(blk.InputHashes).Copy()
-	blk.apply(blk.document)
-	return blk.document
-}
-
 // apply replacements to document
 func (blk *OpBlock) apply(doc *document) {
 	for _, op := range blk.Replacements {
 		doc.replace(blk.Peer, op.Offset, op.Length, op.Text)
 	}
+}
+
+// compute edits to reconstruct merged document for a block
+// this is for when the peer just committed the replacements, so
+// it's document state is prevBlock + replacements. Compute the
+// edits necessary to transform it to the merged document.
+func (blk *OpBlock) edits(s *Session) ([]Replacement, int, int) {
+	// The peer document = parent + edits but it needs the merged state.
+	// It needs to unwind back to the ancestor and then forward to the merged current state.
+	// 1. start with current doc
+	// 2. transform backwards to parent's state by reversing the current edits
+	// 3. transform backwards to ancestor's state by reversing the parent's document from the ancestor
+	// 4. transform forward to current doc by editing forward to the merged document
+	ancestor := s.lca(blk.Parents)
+	parent := blk.peerParent(s)
+	// The client's document is only based on the parent's merged state and its own edits.
+	// We need to compute the edits required to move the client's state to the new merged state.
+	// CurrentDoc models the client's document.
+	// All of CurrentDoc's edits will be returned as the result.
+	currentDoc := blk.getDocumentForAncestor(s, blk)                         // get current doc
+	currentDoc.selection(blk.Peer, blk.SelectionOffset, blk.SelectionLength) // record selection
+	parentDoc := parent.getDocumentForAncestor(s, parent)                    // get previous doc
+	blk.apply(parentDoc)                                                     // edit parent ->  current
+	currentDoc.apply(blk.Peer, parentDoc.reverseEdits())                     // edit current ->  parent
+	parentToAncestor := parent.getDocumentForAncestor(s, ancestor)           // get edits ancestor -> parent
+	currentDoc.apply(blk.Peer, parentToAncestor.reverseEdits())              // edit current -> ancestor
+	ancestorToCurrent := blk.getDocumentForAncestor(s, ancestor)             // get edits ancestor -> current
+	currentDoc.apply(blk.Peer, ancestorToCurrent.edits())                    // edit current -> merged
+	off, len := currentDoc.getSelection(blk.Peer)
+	return currentDoc.edits(), off, len
 }
 
 ///
@@ -299,18 +313,6 @@ func newTwosha(h1 sha, h2 sha) twosha {
 	return result
 }
 
-// blkA.order < blkB.order
-func newLCA(blkA *OpBlock, blkB *OpBlock, ancestor sha) (twosha, *LCA) {
-	key := newTwosha(blkA.Hash, blkB.Hash)
-	return key, &LCA{
-		blkA:     blkA.Hash,
-		orderA:   blkA.order,
-		blkB:     blkB.Hash,
-		orderB:   blkB.order,
-		ancestor: ancestor,
-	}
-}
-
 ///
 /// session
 ///
@@ -322,22 +324,14 @@ func newSession(peer string, text string, storage DocStorage) *Session {
 		latest:        map[string]*OpBlock{},
 		blocks:        map[sha]*OpBlock{src.Hash: src},
 		pendingBlocks: map[sha]*OpBlock{},
-		pendingOn:     map[sha][]*OpBlock{},
-		//checkpoints:   map[sha]*lcaContent{},
-		pendingOps: make([]*Replacement, 0, 8),
-		storage:    storage,
-		blockOrder: append(make([]sha, 0, 8), src.Hash),
+		pendingOn:     map[sha]set[*OpBlock]{},
+		pendingOps:    make([]Replacement, 0, 8),
+		storage:       storage,
+		blockOrder:    append(make([]sha, 0, 8), src.Hash),
 	}
 	s.lcas = map[twosha]*LCA{}
 	storage.StoreBlock(src)
-	//s.checkpoints[sha{}] = newCheckpoint(s, map[string]sha{}, text)
 	return s
-}
-
-func (s *Session) eachBlock(fn func(*OpBlock)) {
-	for _, block := range s.blocks {
-		fn(block)
-	}
 }
 
 func (s *Session) recomputeOrder() {
@@ -345,8 +339,7 @@ func (s *Session) recomputeOrder() {
 	cur := make([]sha, 0, 8)
 	next := append(make([]sha, 0, 8), s.source)
 	seen := set[sha]{}
-	order := 0
-	s.blockOrder = s.blockOrder[:]
+	s.blockOrder = s.blockOrder[:0]
 	for len(next) > 0 {
 		cur, next = next, cur[:0]
 		for _, child := range cur {
@@ -354,10 +347,9 @@ func (s *Session) recomputeOrder() {
 				continue
 			}
 			seen.add(child)
-			s.blockOrder = append(s.blockOrder, child)
 			blk := s.getBlock(child)
-			blk.order = order
-			order++
+			blk.order = len(s.blockOrder)
+			s.blockOrder = append(s.blockOrder, child)
 			next = append(next, blk.children...)
 		}
 	}
@@ -452,45 +444,16 @@ func (s *Session) latestHashes() []sha {
 	return hashes
 }
 
-func hashHash(hashes []sha) sha {
-	hashDoc := &strings.Builder{}
-	for _, hash := range hashes {
-		fmt.Fprintln(hashDoc, hash)
-	}
-	return sha256.Sum256([]byte(hashDoc.String()))
+// add a replacement to pendingOps
+func (s *Session) Replace(offset int, length int, text string) {
+	s.pendingOps = append(s.pendingOps, Replacement{offset, length, text})
 }
 
 // add a replacement to pendingOps
-func (s *Session) Replace(offset int, length int, text string) {
-	s.pendingOps = append(s.pendingOps, &Replacement{offset, length, text})
-}
-
-// compute edits to reconstruct merged document for a block
-func (s *Session) edits(blk *OpBlock) ([]Replacement, int, int) {
-	// the client has the current doc state
-	// in order to merge properly, it needs to unwind back to the ancestor and
-	// then back to the merged current state
-	// 1. start with current doc
-	// 2. transform backwards to parent's state by reversing the current edits
-	// 3. transform backwards to ancestor's state by reversing the parent's document from the ancestor
-	// 4. transform forward to current doc by editing forward to the merged document
-	ancestor := s.lca(blk.Parents)
-	parent := blk.peerParent(s)
-	// The client's document is only based on the parent's merged state and its own edits.
-	// We need to compute the edits required to move the client's state to the new merged state.
-	// CurrentDoc models the client's document.
-	// All of CurrentDoc's edits will be returned as the result.
-	currentDoc := blk.getDocumentForAncestor(s, blk)                         // get current doc
-	currentDoc.selection(blk.Peer, blk.SelectionOffset, blk.SelectionLength) // record selection
-	parentDoc := parent.getDocumentForAncestor(s, parent)                    // get previous doc
-	blk.apply(parentDoc)                                                     // edit parent ->  current
-	currentDoc.apply(blk.Peer, parentDoc.reverseEdits())                     // edit current ->  parent
-	parentToAncestor := parent.getDocumentForAncestor(s, ancestor)           // get edits ancestor -> parent
-	currentDoc.apply(blk.Peer, parentToAncestor.reverseEdits())              // edit current -> ancestor
-	ancestorToCurrent := blk.getDocumentForAncestor(s, ancestor)             // get edits ancestor -> current
-	currentDoc.apply(blk.Peer, ancestorToCurrent.edits())                    // edit current -> merged
-	off, len := currentDoc.getSelection(blk.Peer)
-	return currentDoc.edits(), off, len
+func (s *Session) ReplaceAll(replacements []Replacement) {
+	for _, repl := range replacements {
+		s.Replace(repl.Offset, repl.Length, repl.Text)
+	}
 }
 
 func (s *Session) addBlock(blk *OpBlock) {
@@ -500,7 +463,7 @@ func (s *Session) addBlock(blk *OpBlock) {
 		parent.children = append(parent.children, blk.Hash)
 		parent.addToDescendants(s, blk.Hash, seen)
 	}
-	s.latest[s.peer] = blk
+	s.latest[blk.Peer] = blk
 	s.blocks[blk.Hash] = blk
 	for _, hash := range blk.Parents {
 		if s.getBlock(hash).order == len(s.blocks)-1 {
@@ -529,17 +492,15 @@ func (s *Session) addIncomingBlock(blk *OpBlock) error {
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
-	//prev := s.chains[s.peer]
 	repl := make([]Replacement, len(s.pendingOps))
-	for i := range repl {
-		repl[i] = *s.pendingOps[i]
-	}
+	copy(repl, s.pendingOps)
+	s.pendingOps = s.pendingOps[:0]
 	blk := newOpBlock(s.peer, len(s.blockOrder), s.latestHashes(), repl, selOff, selLen)
 	s.addBlock(blk)
 	if len(blk.Parents) == 1 {
 		return blk.Replacements, selOff, selLen
 	}
-	return s.edits(blk)
+	return blk.edits(s)
 }
 
 func Apply(str string, repl []Replacement) string {
