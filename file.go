@@ -156,7 +156,7 @@ func (p *filePeer) fileChanged() bool {
 		}
 	}
 	repl, _, _ := p.session.Commit(0, 0)
-	newContent := Apply(content, repl)
+	newContent := Apply(p.session.peer, content, repl)
 	if content == newContent {
 		return false
 	}

@@ -19,7 +19,7 @@ type twosha = [sha256.Size * 2]byte
 // hash of all of the blocks
 type Session struct {
 	peer          string
-	source        sha
+	source        *OpBlock
 	latest        map[string]*OpBlock // peer -> block
 	blocks        map[sha]*OpBlock
 	pendingOn     map[sha]set[*OpBlock]
@@ -185,7 +185,7 @@ func (blk *OpBlock) addToDescendants(s *Session, descendant sha, seen set[sha]) 
 	}
 }
 
-// parent for the same peer
+// parent for the same peer, or source block if there is none
 func (blk *OpBlock) peerParent(s *Session) *OpBlock {
 	for _, hash := range blk.Parents {
 		parent := s.getBlock(hash)
@@ -193,7 +193,7 @@ func (blk *OpBlock) peerParent(s *Session) *OpBlock {
 			return parent
 		}
 	}
-	return nil
+	return s.source
 }
 
 // parent for the same peer
@@ -207,6 +207,8 @@ func (blk *OpBlock) peerChild(s *Session) *OpBlock {
 	return nil
 }
 
+// this doesn't freeze and cache the document if it recreates it
+// to set blockDoc, call blk.getDocumentForAncestor(s, blk)
 func (blk *OpBlock) getDocument(s *Session) *document {
 	if blk.document != nil && blk.documentAncestor == blk.Hash {
 		return blk.document
@@ -277,25 +279,25 @@ func (blk *OpBlock) apply(doc *document) {
 func (blk *OpBlock) edits(s *Session) ([]Replacement, int, int) {
 	// The peer document = parent + edits but it needs the merged state.
 	// It needs to unwind back to the ancestor and then forward to the merged current state.
-	// 1. start with current doc
+	// 1. calculate the peer's current doc by applying edits to the previous block
 	// 2. transform backwards to parent's state by reversing the current edits
 	// 3. transform backwards to ancestor's state by reversing the parent's document from the ancestor
 	// 4. transform forward to current doc by editing forward to the merged document
-	ancestor := s.lca(blk.Parents)
-	parent := blk.peerParent(s)
 	// The client's document is only based on the parent's merged state and its own edits.
 	// We need to compute the edits required to move the client's state to the new merged state.
 	// CurrentDoc models the client's document.
 	// All of CurrentDoc's edits will be returned as the result.
-	currentDoc := blk.getDocumentForAncestor(s, blk)                         // get current doc
-	currentDoc.selection(blk.Peer, blk.SelectionOffset, blk.SelectionLength) // record selection
+	ancestor := s.lca(blk.Parents)
+	parent := blk.peerParent(s)
 	parentDoc := parent.getDocumentForAncestor(s, parent)                    // get previous doc
 	blk.apply(parentDoc)                                                     // edit parent ->  current
-	currentDoc.apply(blk.Peer, parentDoc.reverseEdits())                     // edit current ->  parent
-	parentToAncestor := parent.getDocumentForAncestor(s, ancestor)           // get edits ancestor -> parent
-	currentDoc.apply(blk.Peer, parentToAncestor.reverseEdits())              // edit current -> ancestor
-	ancestorToCurrent := blk.getDocumentForAncestor(s, ancestor)             // get edits ancestor -> current
-	currentDoc.apply(blk.Peer, ancestorToCurrent.edits())                    // edit current -> merged
+	currentDoc := parentDoc.Freeze()                                         // snapshot current doc
+	currentDoc.selection(blk.Peer, blk.SelectionOffset, blk.SelectionLength) // record selection
+	currentDoc.apply(blk.Peer, parentDoc.reverseEdits())                     // current -> parent
+	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)           // get edits ancestor -> parent
+	currentDoc.apply(blk.Peer, ancestorToParent.reverseEdits())              // edit current -> ancestor
+	ancestorToMerged := blk.getDocumentForAncestor(s, ancestor)              // get edits ancestor -> merged
+	currentDoc.apply(blk.Peer, ancestorToMerged.edits())                     // edit current -> merged
 	off, len := currentDoc.getSelection(blk.Peer)
 	return currentDoc.edits(), off, len
 }
@@ -321,6 +323,7 @@ func newSession(peer string, text string, storage DocStorage) *Session {
 	src := newOpBlock(peer, 0, []sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
 	src.order = 0
 	s := &Session{
+		source:        src,
 		latest:        map[string]*OpBlock{},
 		blocks:        map[sha]*OpBlock{src.Hash: src},
 		pendingBlocks: map[sha]*OpBlock{},
@@ -337,19 +340,19 @@ func newSession(peer string, text string, storage DocStorage) *Session {
 func (s *Session) recomputeOrder() {
 	// number blocks in breadth-first order from the source by children
 	cur := make([]sha, 0, 8)
-	next := append(make([]sha, 0, 8), s.source)
+	next := append(make([]sha, 0, 8), s.source.Hash)
 	seen := set[sha]{}
 	s.blockOrder = s.blockOrder[:0]
 	for len(next) > 0 {
 		cur, next = next, cur[:0]
-		for _, child := range cur {
-			if seen.has(child) {
+		for _, hash := range cur {
+			if seen.has(hash) {
 				continue
 			}
-			seen.add(child)
-			blk := s.getBlock(child)
+			seen.add(hash)
+			blk := s.getBlock(hash)
 			blk.order = len(s.blockOrder)
-			s.blockOrder = append(s.blockOrder, child)
+			s.blockOrder = append(s.blockOrder, hash)
 			next = append(next, blk.children...)
 		}
 	}
@@ -369,6 +372,7 @@ func (s *Session) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 	if lca != nil && lca.blkA == blkA.Hash && blkA.order == lca.orderA && blkB.order == lca.orderB {
 		return s.getBlock(lca.ancestor)
 	}
+	s.getBlockOrder()
 	// start with the lowest block
 	for i := blkA.order; i >= 0; i-- {
 		anc := s.getBlock(s.blockOrder[i])
@@ -433,6 +437,9 @@ func sortHashes(hashes []sha) {
 
 // sorted hashes of the most recent blocks in the known chains
 func (s *Session) latestHashes() []sha {
+	if len(s.latest) == 0 {
+		return []sha{s.source.Hash}
+	}
 	var hashes []sha
 	hashes = make([]sha, len(s.latest))
 	pos := 0
@@ -468,20 +475,30 @@ func (s *Session) addBlock(blk *OpBlock) {
 	for _, hash := range blk.Parents {
 		if s.getBlock(hash).order == len(s.blocks)-1 {
 			blk.order = len(s.blocks)
-			s.blockOrder = append(s.blockOrder, blk.Hash)
+			if s.blockOrder != nil {
+				s.blockOrder = append(s.blockOrder, blk.Hash)
+			}
 			return
 		}
 	}
 	// none of the parents had order == len(s.blocks)-1
-	s.recomputeOrder()
+	s.blockOrder = nil
+}
+
+func (s *Session) getBlockOrder() []sha {
+	if s.blockOrder == nil {
+		s.recomputeOrder()
+	}
+	return s.blockOrder
 }
 
 func (s *Session) addIncomingBlock(blk *OpBlock) error {
 	if s.hasBlock(blk.Hash) {
+		fmt.Println("Already has block", blk.Hash)
 		return nil
 	}
 	prev := blk.peerParent(s)
-	if prev == nil && s.latest[blk.Peer] != s.getBlock(s.source) || prev.peerChild(s) != nil {
+	if prev == s.source && s.latest[blk.Peer] != nil || prev != s.source && prev.peerChild(s) != nil {
 		return ErrDivergentBlock
 	}
 	s.pendingBlocks[blk.Hash] = blk
@@ -492,29 +509,27 @@ func (s *Session) addIncomingBlock(blk *OpBlock) error {
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
+	latest := s.latest[s.peer]
+	if latest != nil && len(s.pendingOps) == 0 {
+		hashes := s.latestHashes()
+		same := len(hashes) == len(latest.Parents)
+		for i, hash := range hashes {
+			if bytes.Compare(hash[:], latest.Parents[i][:]) != 0 {
+				same = false
+				break
+			}
+		}
+		if same {
+			return []Replacement{}, selOff, selLen
+		}
+	}
 	repl := make([]Replacement, len(s.pendingOps))
 	copy(repl, s.pendingOps)
 	s.pendingOps = s.pendingOps[:0]
-	blk := newOpBlock(s.peer, len(s.blockOrder), s.latestHashes(), repl, selOff, selLen)
+	blk := newOpBlock(s.peer, len(s.blocks), s.latestHashes(), repl, selOff, selLen)
 	s.addBlock(blk)
 	if len(blk.Parents) == 1 {
 		return blk.Replacements, selOff, selLen
 	}
 	return blk.edits(s)
-}
-
-func Apply(str string, repl []Replacement) string {
-	sb := &strings.Builder{}
-	pos := 0
-	for _, r := range repl {
-		if r.Offset > pos {
-			sb.WriteString(str[pos:r.Offset])
-		}
-		sb.WriteString(r.Text)
-		pos += r.Length
-	}
-	if pos < len(str) {
-		sb.WriteString(str[pos:])
-	}
-	return sb.String()
 }

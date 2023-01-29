@@ -2,6 +2,7 @@ package peerot
 
 import (
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -15,24 +16,32 @@ func replace(t *testing.T, tree *document, peer string, start int, length int, t
 		fmt.Printf("Bad tree '%s', expected '%s'\n", tree.String(), expect)
 		t.FailNow()
 	}
-	//fmt.Println("Tree:", tree)
-	//fmt.Println("Ops:", tree.opString())
 }
 
 func testEqual(t *testing.T, actual any, expected any, msg string) {
 	failIfNot(t, actual == expected, fmt.Sprintf("%s: expected <%v> but got <%v>", msg, expected, actual))
 }
 
+func testEqualRepls(t *testing.T, repl1, repl2 []Replacement, msg string) {
+	testEqual(t, len(repl1), len(repl2), msg)
+	for i, repl := range repl1 {
+		testEqual(t, repl, repl2[i], msg)
+	}
+}
+
 func failIfNot(t *testing.T, cond bool, msg string) {
 	if !cond {
 		t.Log(msg)
-		t.Fail()
+		fmt.Fprintln(os.Stderr, msg)
+		debug.PrintStack()
+		t.FailNow()
 	}
 }
 
 func failIfErrNow(t *testing.T, err any) {
 	if err != nil {
 		t.Log(err)
+		fmt.Fprintln(os.Stderr, err)
 		debug.PrintStack()
 		t.FailNow()
 	}
@@ -104,13 +113,9 @@ func docs(t *testing.T) (*document, *document) {
 func TestMerge(t *testing.T) {
 	a, b := docs(t)
 	a.merge(b)
-	//fmt.Println("Merged:", a)
-	//fmt.Println("Ops:", a.opString())
 	testEqual(t, a.String(), docMerged, "unsuccessful merge")
 	a, b = docs(t)
 	b.merge(a)
-	//fmt.Println("Merged:", b)
-	//fmt.Println("Ops:", b.opString())
 	bDoc := b.String()
 	testEqual(t, bDoc, docMerged, "unsuccessful merge")
 	revDoc := newDocument(bDoc)
@@ -127,19 +132,36 @@ func commitEdits(t *testing.T, s *Session, doc *document, expected []Replacement
 func commitReplacements(t *testing.T, s *Session, edits []Replacement, expected []Replacement) {
 	s.ReplaceAll(edits)
 	repl, _, _ := s.Commit(0, 0)
-	testEqual(t, len(repl), len(expected), "replacements did not match after commit")
-	for i := range repl {
-		testEqual(t, repl[i], expected[i], "replacements did not match after commit")
+	testEqualRepls(t, repl, expected, "replacements did not match after commit")
+	latest := s.latest[s.peer]
+	prev := latest.peerParent(s)
+	if prev == nil {
+		prev = s.source
 	}
+	anc := latest.getDocumentForAncestor(s, prev)
+	testEqualRepls(t, anc.edits(), edits, "ancestor edits did not match")
 }
 
-func mergeBlock(t *testing.T, peer string, s *Session, blk *OpBlock, startDoc, expected string) {
+func addBlock(t *testing.T, peer string, s *Session, blk *OpBlock, expected string) {
 	l := len(s.blockOrder)
-	s.addIncomingBlock(blk)
+	failIfErrNow(t, s.addIncomingBlock(blk))
 	testBlockOrder(t, s, l+1, 1)
+	prev := blk.peerParent(s)
+	if prev == nil {
+		prev = s.source
+	}
+	ancestor := s.lca(blk.Parents)
+	ancestorDoc := ancestor.getDocumentForAncestor(s, ancestor)
+	anc := s.latest[blk.Peer].getDocumentForAncestor(s, prev)
+	testEqual(t, anc.String(), expected, "ancestor doc did not match")
+	testEqual(t, anc.OriginalString(), ancestorDoc.String(), "ancestor doc did not match")
+}
+
+func testCommit(t *testing.T, peer string, s *Session, startDoc, expected string) {
 	repl, _, _ := s.Commit(0, 0)
-	str := Apply(startDoc, repl)
-	testEqual(t, str, expected, "Result did not match expected")
+	str := newDocument(startDoc)
+	str.apply(peer, repl)
+	testEqual(t, str.String(), expected, "Result did not match expected")
 }
 
 // strip out local data
@@ -159,7 +181,7 @@ func testBlockOrder(t *testing.T, s *Session, expected, additional int) {
 	lenBlocks := len(s.blocks)
 	testEqual(t, lenBlocks, expected,
 		fmt.Sprintf("session %s expected len(blocks) = %d but got %d\n", s.peer, expected, len(s.blocks)))
-	lenOrder := len(s.blockOrder)
+	lenOrder := len(s.getBlockOrder())
 	testEqual(t, lenOrder, expected,
 		fmt.Sprintf("session %s expected len(blockOrder) = %d but got %d\n", s.peer, expected, len(s.blockOrder)))
 	for _, hash := range s.blockOrder[lenOrder-additional:] {
@@ -167,16 +189,27 @@ func testBlockOrder(t *testing.T, s *Session, expected, additional int) {
 	}
 }
 
+func testSession(t *testing.T, initialPeer, peer string, doc string) *Session {
+	s := newSession(initialPeer, doc1, NewMemoryStorage())
+	s.peer = peer
+	testBlockOrder(t, s, 1, 1)
+	return s
+}
+
 func TestEditing(t *testing.T) {
-	s1 := newSession("peer1", doc1, NewMemoryStorage())
-	testBlockOrder(t, s1, 1, 1)
-	s2 := newSession("peer2", doc1, NewMemoryStorage())
-	testBlockOrder(t, s2, 1, 1)
+	s1 := testSession(t, "base", "peer1", doc1)
+	s2 := testSession(t, "base", "peer2", doc1)
 	d1, d2 := docs(t)
+	doc1 := d1.String()
+	doc2 := d2.String()
 	commitEdits(t, s1, d1, d1.edits())
 	testBlockOrder(t, s1, 2, 1)
 	commitEdits(t, s2, d2, d2.edits())
 	testBlockOrder(t, s2, 2, 1)
-	mergeBlock(t, "peer1", s1, outgoing(s2, s2.peer), d1.String(), docMerged)
-	mergeBlock(t, "peer2", s2, outgoing(s1, s1.peer), d2.String(), docMerged)
+	blk1 := outgoing(s1, s1.peer)
+	blk2 := outgoing(s2, s2.peer)
+	addBlock(t, "peer1", s1, blk2, doc2)
+	testCommit(t, "peer1", s1, doc1, docMerged)
+	addBlock(t, "peer2", s2, blk1, doc1)
+	testCommit(t, "peer2", s2, doc2, docMerged)
 }

@@ -316,11 +316,23 @@ func (d *document) Freeze() *document {
 	return newDocument(d.String())
 }
 
-// print the new document
+// string for the new document
 func (d *document) String() string {
 	sb := &strings.Builder{}
 	for _, item := range d.ops.ToSlice() {
 		fmt.Fprint(sb, item)
+	}
+	return sb.String()
+}
+
+// string for the original document
+func (d *document) OriginalString() string {
+	sb := &strings.Builder{}
+	for _, item := range d.ops.ToSlice() {
+		switch op := item.(type) {
+		case *deleteOp, *retainOp:
+			fmt.Fprint(sb, op.text())
+		}
 	}
 	return sb.String()
 }
@@ -545,13 +557,15 @@ func (d *document) splitOnMarker(name string) (opTree, opTree) {
 
 func (d *document) getSelection(peer string) (int, int) {
 	left, right := d.splitOnMarker(selectionStart(peer))
-	if _, ok := right.PeekFirst().(*markerOp); ok {
-		mid, end := d.splitOnMarker(selectionEnd(peer))
-		if _, ok := end.PeekFirst().(*markerOp); ok {
-			return left.Measure().newLen, mid.Measure().newLen
+	if !right.IsEmpty() {
+		if _, ok := right.PeekFirst().(*markerOp); ok {
+			mid, end := d.splitOnMarker(selectionEnd(peer))
+			if _, ok := end.PeekFirst().(*markerOp); ok {
+				return left.Measure().newLen, mid.Measure().newLen
+			}
 		}
 	}
-	return 0, 0
+	return -1, -1
 }
 
 // append edits that restore the original document
@@ -591,6 +605,12 @@ func (d *document) edits() []Replacement {
 
 func (d *document) apply(peer string, edits []Replacement) {
 	for _, repl := range edits {
-		d.replace(peer, repl.Offset, repl.Offset, repl.Text)
+		d.replace(peer, repl.Offset, repl.Length, repl.Text)
 	}
+}
+
+func Apply(peer, str string, repl []Replacement) string {
+	doc := newDocument(peer, str)
+	doc.apply(peer, repl)
+	return doc.String()
 }
