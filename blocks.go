@@ -28,19 +28,19 @@ type Session struct {
 	pendingOps    []Replacement
 	lcas          map[twosha]*LCA // 2-block LCAs
 	blockOrder    []sha
+	dirtyBlocks   []*OpBlock // stored at the end of a commit
 }
 
 type DocStorage interface {
-	HasPendingBlock(hash sha) bool
-	StoreBlock(blk *OpBlock) // removes from pending
 	GetBlock(hash sha) *OpBlock
 	HasBlock(hash sha) bool
+	StoreBlocks(blks []*OpBlock) // removes from pending and pendingOn
+	HasPendingBlock(hash sha) bool
+	GetPendingBlock(hash sha) *OpBlock
 	StorePendingBlock(*OpBlock)
-	GetPendingBlocks() []*OpBlock
 	StoreParameters(latest map[string]sha, pendingOps []Replacement)
-	Pending(blk sha)
-	PendingOn(blk sha, pendingBlock sha)
-	Dirty(blk *OpBlock)
+	PendingOn(blk sha, pendingBlock *OpBlock)
+	StoreBlockDoc(blk *OpBlock)
 }
 
 // a block the editing dag
@@ -82,6 +82,8 @@ type Replacement struct {
 type MemoryStorage struct {
 	blocks        map[sha]*OpBlock
 	pendingBlocks map[sha]*OpBlock
+	pendingOn     map[sha]set[*OpBlock]
+	blockDocs     map[sha]string
 }
 
 ///
@@ -89,35 +91,40 @@ type MemoryStorage struct {
 ///
 
 func NewMemoryStorage() *MemoryStorage {
-	return &MemoryStorage{map[sha]*OpBlock{}, map[sha]*OpBlock{}}
-}
-
-func (st *MemoryStorage) GetBlock(hash sha) *OpBlock {
-	return st.blocks[hash]
-}
-
-func (st *MemoryStorage) HasPendingBlock(hash sha) bool {
-	return st.pendingBlocks[hash] != nil
-}
-
-func (st *MemoryStorage) GetPendingBlocks() []*OpBlock {
-	blocks := make([]*OpBlock, 0, len(st.pendingBlocks))
-	for _, blk := range st.pendingBlocks {
-		blocks = append(blocks, blk)
+	return &MemoryStorage{
+		blocks:        map[sha]*OpBlock{},
+		pendingBlocks: map[sha]*OpBlock{},
+		pendingOn:     map[sha]set[*OpBlock]{},
+		blockDocs:     map[sha]string{},
 	}
-	return blocks
-}
-
-func (st *MemoryStorage) StorePendingBlock(blk *OpBlock) {
-	st.pendingBlocks[blk.Hash] = blk
 }
 
 func (st *MemoryStorage) HasBlock(hash sha) bool {
 	return st.blocks[hash] != nil
 }
 
-func (st *MemoryStorage) StoreBlock(blk *OpBlock) {
-	st.blocks[blk.Hash] = blk
+func (st *MemoryStorage) GetBlock(hash sha) *OpBlock {
+	return st.blocks[hash]
+}
+
+func (st *MemoryStorage) StoreBlocks(blks []*OpBlock) {
+	for _, blk := range blks {
+		st.blocks[blk.Hash] = blk.clean()
+		delete(st.pendingBlocks, blk.Hash)
+		delete(st.pendingOn, blk.Hash)
+	}
+}
+
+func (st *MemoryStorage) HasPendingBlock(hash sha) bool {
+	return st.pendingBlocks[hash] != nil
+}
+
+func (st *MemoryStorage) GetPendingBlock(hash sha) *OpBlock {
+	return st.pendingBlocks[hash]
+}
+
+func (st *MemoryStorage) StorePendingBlock(blk *OpBlock) {
+	st.pendingBlocks[blk.Hash] = blk
 }
 
 func (st *MemoryStorage) StoreParameters(latest map[string]sha, pendingOps []Replacement) {
@@ -125,9 +132,16 @@ func (st *MemoryStorage) StoreParameters(latest map[string]sha, pendingOps []Rep
 
 func (st *MemoryStorage) Dirty(blk *OpBlock) {}
 
-func (st *MemoryStorage) Pending(blk sha) {}
+func (st *MemoryStorage) PendingOn(hash sha, pendingBlock *OpBlock) {
+	if st.pendingOn[hash] == nil {
+		st.pendingOn[hash] = set[*OpBlock]{}
+	}
+	st.pendingOn[hash].add(pendingBlock)
+}
 
-func (st *MemoryStorage) PendingOn(blk sha, pendingBlock sha) {}
+func (st *MemoryStorage) StoreBlockDoc(blk *OpBlock) {
+	st.blockDocs[blk.Hash] = blk.blockDoc.String()
+}
 
 ///
 /// opBlock
@@ -146,6 +160,18 @@ func newOpBlock(peer string, nonce int, parents []sha, repl []Replacement, selOf
 	blk.computeHash()
 	blk.descendants = newSet(blk.Hash)
 	return blk
+}
+
+func (blk *OpBlock) clean() *OpBlock {
+	return &OpBlock{
+		Hash:            blk.Hash,
+		Peer:            blk.Peer,
+		Nonce:           blk.Nonce,
+		Parents:         blk.Parents,
+		Replacements:    blk.Replacements,
+		SelectionOffset: blk.SelectionOffset,
+		SelectionLength: blk.SelectionLength,
+	}
 }
 
 func (blk *OpBlock) isSource() bool {
@@ -333,7 +359,7 @@ func newSession(peer string, text string, storage DocStorage) *Session {
 		blockOrder:    append(make([]sha, 0, 8), src.Hash),
 	}
 	s.lcas = map[twosha]*LCA{}
-	storage.StoreBlock(src)
+	storage.StoreBlocks([]*OpBlock{src})
 	return s
 }
 
@@ -421,12 +447,21 @@ LCA:
 func (s *Session) getBlock(hash sha) *OpBlock {
 	if s.blocks[hash] != nil {
 		return s.blocks[hash]
+	} else if s.pendingBlocks[hash] != nil {
+		return s.pendingBlocks[hash]
 	}
-	return s.pendingBlocks[hash]
+	if blk := s.storage.GetBlock(hash); blk != nil {
+		return blk
+	}
+	return s.storage.GetPendingBlock(hash)
 }
 
 func (s *Session) hasBlock(hash sha) bool {
-	return s.blocks[hash] != nil || s.pendingBlocks[hash] != nil
+	return s.blocks[hash] != nil || s.storage.HasBlock(hash)
+}
+
+func (s *Session) hasPendingBlock(hash sha) bool {
+	return s.pendingBlocks[hash] != nil || s.storage.HasPendingBlock(hash)
 }
 
 func sortHashes(hashes []sha) {
@@ -493,7 +528,7 @@ func (s *Session) getBlockOrder() []sha {
 }
 
 func (s *Session) addIncomingBlock(blk *OpBlock) error {
-	if s.hasBlock(blk.Hash) {
+	if s.hasBlock(blk.Hash) || s.hasPendingBlock(blk.Hash) {
 		fmt.Println("Already has block", blk.Hash)
 		return nil
 	}
