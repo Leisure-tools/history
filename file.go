@@ -1,4 +1,4 @@
-package peerot
+package history
 
 import (
 	"errors"

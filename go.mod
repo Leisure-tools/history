@@ -1,4 +1,4 @@
-module github.com/zot/peerot
+module github.com/leisure-tools/history
 
 go 1.18
 
