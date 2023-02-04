@@ -9,7 +9,6 @@ import (
 	"path"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	diff "github.com/sergi/go-diff/diffmatchpatch"
 )
 
@@ -20,7 +19,6 @@ var ErrWatcherCreate = fmt.Errorf("%w, could not create watcher", ErrPeer)
 var ErrWatcherPath = fmt.Errorf("%w, could not watch path", ErrPeer)
 
 type filePeer struct {
-	peer         string
 	path         string
 	content      string
 	session      *Session
@@ -33,7 +31,7 @@ type filePeer struct {
 // opaque type to separate service API from internal API so no scramble brains
 type filePeerService filePeer
 
-func NewFilePeer(peer, file string, shutdownHook func()) (*filePeerService, error) {
+func NewFilePeer(s *Session, file string, shutdownHook func()) (*filePeerService, error) {
 	file = path.Clean(file)
 	if !path.IsAbs(file) {
 		dir, err := os.Getwd()
@@ -49,10 +47,10 @@ func NewFilePeer(peer, file string, shutdownHook func()) (*filePeerService, erro
 	service := make(chanSvc)
 	runSvc(service)
 	return (*filePeerService)(&filePeer{
-		peer:         peer,
 		path:         file,
 		changed:      func() {},
 		service:      service,
+		session:      s,
 		shutdownHook: hooks,
 	}), nil
 }
@@ -74,8 +72,9 @@ func (s *filePeerService) shutdown(args ...any) {
 
 func (s *filePeerService) GetUpdates() []Replacement {
 	return svcSync(s.service, func() []Replacement {
-		repl, _, _ := (*filePeer)(s).session.Commit(0, 0)
-		return repl
+		//repl, _, _ := (*filePeer)(s).session.Commit(0, 0)
+		//return repl
+		return []Replacement{}
 	})
 }
 
@@ -155,57 +154,57 @@ func (p *filePeer) fileChanged() bool {
 			p.session.Replace(pos, 0, dif.Text)
 		}
 	}
-	repl, _, _ := p.session.Commit(0, 0)
-	newContent := Apply(p.session.peer, content, repl)
-	if content == newContent {
-		return false
-	}
-	p.content = newContent
+	//repl, _, _ := p.session.Commit(0, 0)
+	//newContent := doc.Apply(p.session.peer, content, repl)
+	//if content == newContent {
+	//	return false
+	//}
+	//p.content = newContent
 	return true
 }
 
 func (s *filePeerService) Monitor(changed chan bool, control func()) error {
-	// safe to mess with the peer because the service has not started yet
-	p := (*filePeer)(s)
-	file, err := os.ReadFile(p.path)
-	if err != nil {
-		return fmt.Errorf("%w: %s", ErrBadPath, p.path)
-	}
-	p.session = newSession(p.peer, string(file), NewMemoryStorage())
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return ErrWatcherCreate
-	}
-	defer watcher.Close()
-	dir := path.Dir(p.path)
-	//filename := path.Base(p.path)
-	// Start listening for events.
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				log.Println("event:", event, "name:", event.Name)
-				if event.Has(fsnotify.Write) && event.Name == p.path {
-					fmt.Println(p.path, "changed")
-					s.fileChanged(changed)
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					log.Fatal(err)
-					s.shutdown()
-					return
-				}
-				log.Println("error:", err)
-			}
-		}
-	}()
-	err = watcher.Add(dir)
-	if err != nil {
-		log.Fatal(err)
-	}
+	//// safe to mess with the peer because the service has not started yet
+	//p := (*filePeer)(s)
+	//file, err := os.ReadFile(p.path)
+	//if err != nil {
+	//	return fmt.Errorf("%w: %s", ErrBadPath, p.path)
+	//}
+	//p.session = NewChanges(p.peer, string(file), NewMemoryStorage())
+	//watcher, err := fsnotify.NewWatcher()
+	//if err != nil {
+	//	return ErrWatcherCreate
+	//}
+	//defer watcher.Close()
+	//dir := path.Dir(p.path)
+	////filename := path.Base(p.path)
+	//// Start listening for events.
+	//go func() {
+	//	for {
+	//		select {
+	//		case event, ok := <-watcher.Events:
+	//			if !ok {
+	//				return
+	//			}
+	//			log.Println("event:", event, "name:", event.Name)
+	//			if event.Has(fsnotify.Write) && event.Name == p.path {
+	//				fmt.Println(p.path, "changed")
+	//				s.fileChanged(changed)
+	//			}
+	//		case err, ok := <-watcher.Errors:
+	//			if !ok {
+	//				log.Fatal(err)
+	//				s.shutdown()
+	//				return
+	//			}
+	//			log.Println("error:", err)
+	//		}
+	//	}
+	//}()
+	//err = watcher.Add(dir)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
 	control()
 	return nil
 }
