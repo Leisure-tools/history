@@ -189,7 +189,6 @@ func TestEditing(t *testing.T) {
 	blk1 := outgoing(s1)
 	blk2 := outgoing(s2)
 	addBlock(t, s1, blk2, doc2)
-	cfg.verbose = true
 	testCommit(t, s1, doc1, docMerged)
 	addBlock(t, s2, blk1, doc1)
 	testCommit(t, s2, doc2, docMerged)

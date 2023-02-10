@@ -259,26 +259,18 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 
 func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *document {
 	s.getBlockOrder()
-	verbose("%d get document for %d\n", blk.order, ancestor.order)
 	if ancestor == blk {
 		return blk.GetDocument(s)
 	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
 		doc := ancestor.GetDocument(s).Copy()
-		verbose("ANCESTOR-DOC: %v\n", doc)
-		//verbose("HISTORY-DOC: (%d ancestors)\n%s", len(blk.Parents), doc.Changes("  "))
 		for _, hash := range blk.Parents {
 			parent := s.getBlock(hash)
-			if parent == ancestor {
-				continue
+			if parent != ancestor {
+				parentDoc := parent.getDocumentForAncestor(s, ancestor)
+				doc.Merge(parentDoc)
 			}
-			parentDoc := parent.getDocumentForAncestor(s, ancestor)
-			verbose("MERGING-PARENT-DOC: %s\n%s", parent.Peer, parentDoc.Changes("  "))
-			doc.Merge(parentDoc)
 		}
-		verbose("MERGED-DOC:\n%s", doc.Changes("  "))
-		verbose("REPLACEMENTS: %v\n", blk.Replacements)
 		blk.applyTo(doc)
-		verbose("RESULT-DOC: %s\n%s", blk.Peer, doc.Changes("  "))
 		blk.documentAncestor = ancestor.Hash
 		blk.document = doc
 	}
@@ -325,14 +317,13 @@ func (blk *OpBlock) edits(s *History) ([]Replacement, int, int) {
 	// reverse(parent->current)
 	// + reverse(ancestor -> parent)
 	// + get ancestor -> merged
-	verbose("GETTING-EDITS-FOR-BLOCK")
+	s.getBlockOrder()
 	parent := blk.peerParent(s)
 	ancestor := s.lca(blk.Parents)
 	parentToCurrent := parent.GetDocument(s)
 	blk.applyTo(parentToCurrent)
 	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)
 	ancestorToMerged := blk.getDocumentForAncestor(s, ancestor)
-	fmt.Printf("ancestorToMerged: %v\n", ancestorToMerged.Edits())
 	peerDoc := parentToCurrent.Freeze()
 	selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
 	peerDoc.Apply(blk.Peer, parentToCurrent.ReverseEdits())
@@ -623,25 +614,12 @@ func selectionEnd(peer string) string {
 func getSelection(d *document, peer string) (int, int) {
 	left, right := d.SplitOnMarker(selectionStart(peer))
 	if !right.IsEmpty() {
-		if _, ok := right.PeekFirst().(*doc.MarkerOp); ok {
+		if doc.Isa[*doc.MarkerOp](right.PeekFirst()) {
 			mid, end := d.SplitOnMarker(selectionEnd(peer))
-			if _, ok := end.PeekFirst().(*doc.MarkerOp); ok {
+			if doc.Isa[*doc.MarkerOp](end.PeekFirst()) {
 				return left.Measure().NewLen, mid.Measure().NewLen
 			}
 		}
 	}
 	return -1, -1
-}
-
-// UTILS
-type config struct {
-	verbose bool
-}
-
-var cfg config
-
-func verbose(format string, args ...any) {
-	if cfg.verbose {
-		fmt.Printf(format, args...)
-	}
 }
