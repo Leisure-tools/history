@@ -1,3 +1,6 @@
+// Package history represents the history of a document as a DAG of operations
+// Each document has a unique ID
+// Session objects hold peer ID and track pending changes to a document
 package history
 
 import (
@@ -5,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 
@@ -18,12 +22,11 @@ type document = doc.Document
 type Replacement = doc.Replacement
 type Sha = [sha256.Size]byte
 type Twosha = [sha256.Size * 2]byte
+type UUID [16]byte
 
 // History of a document
-// checkpoints are stored by the most recent block hash of each peer and also by the
-// hash of all of the blocks
 type History struct {
-	DocID         string
+	DocID         UUID
 	Source        *OpBlock
 	Latest        map[string]*OpBlock // peer -> block
 	Blocks        map[Sha]*OpBlock
@@ -51,6 +54,13 @@ type Session struct {
 	Peer       string
 	PendingOps []Replacement
 	History    *History
+}
+
+// UUIDs
+func newUUID() UUID {
+	var uuid UUID
+	rand.Read(uuid[:])
+	return uuid
 }
 
 // a block the editing dag
@@ -237,38 +247,42 @@ func (blk *OpBlock) peerChild(s *History) *OpBlock {
 	return nil
 }
 
-// this doesn't freeze and cache the document if it recreates it
-// to set blockDoc, call blk.getDocumentForAncestor(s, blk)
-func (blk *OpBlock) getDocument(s *History) *document {
-	if blk.document != nil && blk.documentAncestor == blk.Hash {
-		return blk.document
-	} else if blk.isSource() {
+// get the frozen document for this block
+func (blk *OpBlock) GetDocument(s *History) *document {
+	if blk.blockDoc == nil && blk.isSource() {
 		blk.blockDoc = doc.NewDocument(blk.Replacements[0].Text)
-		return blk.blockDoc
+	} else if blk.blockDoc == nil {
+		blk.blockDoc = blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze()
 	}
-	blk.documentAncestor = blk.Hash
-	blk.document = blk.getDocumentForAncestor(s, s.lca(blk.Parents))
-	return blk.document
+	return blk.blockDoc.Copy()
 }
 
 func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *document {
-	if ancestor == blk && blk.blockDoc != nil {
-		return blk.blockDoc
-	} else if ancestor == blk {
-		// haven't cached a blockDoc yet
-		blk.blockDoc = blk.getDocument(s).Freeze()
-		return blk.blockDoc
-	} else if blk.document != nil && blk.documentAncestor == ancestor.Hash {
-		return blk.document
+	s.getBlockOrder()
+	verbose("%d get document for %d\n", blk.order, ancestor.order)
+	if ancestor == blk {
+		return blk.GetDocument(s)
+	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
+		doc := ancestor.GetDocument(s).Copy()
+		verbose("ANCESTOR-DOC: %v\n", doc)
+		//verbose("HISTORY-DOC: (%d ancestors)\n%s", len(blk.Parents), doc.Changes("  "))
+		for _, hash := range blk.Parents {
+			parent := s.getBlock(hash)
+			if parent == ancestor {
+				continue
+			}
+			parentDoc := parent.getDocumentForAncestor(s, ancestor)
+			verbose("MERGING-PARENT-DOC: %s\n%s", parent.Peer, parentDoc.Changes("  "))
+			doc.Merge(parentDoc)
+		}
+		verbose("MERGED-DOC:\n%s", doc.Changes("  "))
+		verbose("REPLACEMENTS: %v\n", blk.Replacements)
+		blk.applyTo(doc)
+		verbose("RESULT-DOC: %s\n%s", blk.Peer, doc.Changes("  "))
+		blk.documentAncestor = ancestor.Hash
+		blk.document = doc
 	}
-	doc := ancestor.getDocumentForAncestor(s, ancestor).Copy()
-	for _, hash := range blk.Parents {
-		doc.Merge(s.getBlock(hash).getDocumentForAncestor(s, ancestor))
-	}
-	blk.apply(doc)
-	blk.documentAncestor = ancestor.Hash
-	blk.document = doc
-	return doc
+	return blk.document.Copy()
 }
 
 // blocks come in any order because of pubsub
@@ -295,8 +309,8 @@ func (blk *OpBlock) checkPending(s *History) {
 	}
 }
 
-// apply replacements to document
-func (blk *OpBlock) apply(doc *document) {
+// applyTo replacements to document
+func (blk *OpBlock) applyTo(doc *document) {
 	for _, op := range blk.Replacements {
 		doc.Replace(blk.Peer, op.Offset, op.Length, op.Text)
 	}
@@ -307,29 +321,26 @@ func (blk *OpBlock) apply(doc *document) {
 // it's document state is prevBlock + replacements. Compute the
 // edits necessary to transform it to the merged document.
 func (blk *OpBlock) edits(s *History) ([]Replacement, int, int) {
-	// The peer document = parent + edits but it needs the merged state.
-	// It needs to unwind back to the ancestor and then forward to the merged current state.
-	// 1. calculate the peer's current doc by applying edits to the previous block
-	// 2. transform backwards to parent's state by reversing the current edits
-	// 3. transform backwards to ancestor's state by reversing the parent's document from the ancestor
-	// 4. transform forward to current doc by editing forward to the merged document
-	// The client's document is only based on the parent's merged state and its own edits.
-	// We need to compute the edits required to move the client's state to the new merged state.
-	// CurrentDoc models the client's document.
-	// All of CurrentDoc's edits will be returned as the result.
-	ancestor := s.lca(blk.Parents)
+	// to get to the merged doc from peer's current doc:
+	// reverse(parent->current)
+	// + reverse(ancestor -> parent)
+	// + get ancestor -> merged
+	verbose("GETTING-EDITS-FOR-BLOCK")
 	parent := blk.peerParent(s)
-	parentDoc := parent.getDocumentForAncestor(s, parent)                     // get previous doc
-	blk.apply(parentDoc)                                                      // edit parent ->  current
-	currentDoc := parentDoc.Freeze()                                          // snapshot current doc
-	selection(currentDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength) // record selection
-	currentDoc.Apply(blk.Peer, parentDoc.ReverseEdits())                      // current -> parent
-	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)            // get edits ancestor -> parent
-	currentDoc.Apply(blk.Peer, ancestorToParent.ReverseEdits())               // edit current -> ancestor
-	ancestorToMerged := blk.getDocumentForAncestor(s, ancestor)               // get edits ancestor -> merged
-	currentDoc.Apply(blk.Peer, ancestorToMerged.Edits())                      // edit current -> merged
-	off, len := getSelection(currentDoc, blk.Peer)
-	return currentDoc.Edits(), off, len
+	ancestor := s.lca(blk.Parents)
+	parentToCurrent := parent.GetDocument(s)
+	blk.applyTo(parentToCurrent)
+	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)
+	ancestorToMerged := blk.getDocumentForAncestor(s, ancestor)
+	fmt.Printf("ancestorToMerged: %v\n", ancestorToMerged.Edits())
+	peerDoc := parentToCurrent.Freeze()
+	selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+	peerDoc.Apply(blk.Peer, parentToCurrent.ReverseEdits())
+	peerDoc.Apply(blk.Peer, ancestorToParent.ReverseEdits())
+	peerDoc.Apply(blk.Peer, ancestorToMerged.Edits())
+	peerDoc.Simplify()
+	offset, length := getSelection(peerDoc, blk.Peer)
+	return peerDoc.Edits(), offset, length
 }
 
 ///
@@ -365,7 +376,7 @@ func NewHistory(docId, text string, storage DocStorage) *History {
 	src := newOpBlock("", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
 	src.order = 0
 	s := &History{
-		DocID:         docId,
+		DocID:         newUUID(),
 		Source:        src,
 		Latest:        map[string]*OpBlock{},
 		Blocks:        map[Sha]*OpBlock{src.Hash: src},
@@ -395,6 +406,7 @@ func (s *History) recomputeOrder() {
 			blk := s.getBlock(hash)
 			blk.order = len(s.BlockOrder)
 			s.BlockOrder = append(s.BlockOrder, hash)
+			sortHashes(blk.children)
 			next = append(next, blk.children...)
 		}
 	}
@@ -405,6 +417,7 @@ func (s *History) recomputeOrder() {
 // these are cached; when new blocks come in from outside,
 // they can cause renumbering, which clears the cache
 func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
+	s.getBlockOrder()
 	// ensure blkA is the lower block
 	if blkB.order < blkA.order {
 		blkA, blkB = blkB, blkA
@@ -414,7 +427,6 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 	if lca != nil && lca.blkA == blkA.Hash && blkA.order == lca.orderA && blkB.order == lca.orderB {
 		return s.getBlock(lca.ancestor)
 	}
-	s.getBlockOrder()
 	// start with the lowest block
 	for i := blkA.order; i >= 0; i-- {
 		anc := s.getBlock(s.BlockOrder[i])
@@ -504,7 +516,7 @@ func (s *History) latestHashes() []Sha {
 
 // add a replacement to pendingOps
 func (s *Session) Replace(offset int, length int, text string) {
-	s.PendingOps = append(s.PendingOps, Replacement{offset, length, text})
+	s.PendingOps = append(s.PendingOps, Replacement{Offset: offset, Length: length, Text: text})
 }
 
 // add a replacement to pendingOps
@@ -545,7 +557,7 @@ func (s *History) getBlockOrder() []Sha {
 
 func (s *History) addIncomingBlock(blk *OpBlock) error {
 	if s.hasBlock(blk.Hash) || s.hasPendingBlock(blk.Hash) {
-		fmt.Println("Already has block", blk.Hash)
+		//fmt.Println("Already has block", blk.Hash)
 		return nil
 	}
 	prev := blk.peerParent(s)
@@ -579,9 +591,6 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 	s.PendingOps = s.PendingOps[:0]
 	blk := newOpBlock(s.Peer, len(s.History.Blocks), s.History.latestHashes(), repl, selOff, selLen)
 	s.History.addBlock(blk)
-	if len(blk.Parents) == 1 {
-		return blk.Replacements, selOff, selLen
-	}
 	return blk.edits(s.History)
 }
 
@@ -597,9 +606,9 @@ func selection(d *document, peer string, start int, length int) {
 		return m.NewLen > length
 	})
 	d.Ops = left.
-		AddLast(&doc.MarkerOp{selectionStart(peer)}).
+		AddLast(doc.NewMarkerOp(selectionStart(peer))).
 		Concat(mid).
-		AddLast(&doc.MarkerOp{selectionEnd(peer)}).
+		AddLast(doc.NewMarkerOp(selectionEnd(peer))).
 		Concat(end)
 }
 
@@ -622,4 +631,17 @@ func getSelection(d *document, peer string) (int, int) {
 		}
 	}
 	return -1, -1
+}
+
+// UTILS
+type config struct {
+	verbose bool
+}
+
+var cfg config
+
+func verbose(format string, args ...any) {
+	if cfg.verbose {
+		fmt.Printf(format, args...)
+	}
 }
