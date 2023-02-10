@@ -122,7 +122,7 @@ func commitReplacements(t *testing.T, s *Session, edits []Replacement, expected 
 }
 
 func addBlock(t *testing.T, s *Session, blk *OpBlock, expected string) {
-	l := len(s.History.BlockOrder)
+	l := s.History.Storage.GetBlockCount()
 	failIfErrNow(t, s.History.addIncomingBlock(blk))
 	testBlockOrder(t, s, l+1, 1)
 	prev := blk.peerParent(s.History)
@@ -157,9 +157,10 @@ func outgoing(s *Session) *OpBlock {
 }
 
 func testBlockOrder(t *testing.T, s *Session, expected, additional int) {
-	lenBlocks := len(s.History.Blocks)
+	s.History.getBlockOrder()
+	lenBlocks := s.History.Storage.GetBlockCount()
 	testEqual(t, lenBlocks, expected,
-		fmt.Sprintf("session expected len(blocks) = %d but got %d\n", expected, len(s.History.Blocks)))
+		fmt.Sprintf("session expected len(blocks) = %d but got %d\n", expected, lenBlocks))
 	lenOrder := len(s.History.getBlockOrder())
 	testEqual(t, lenOrder, expected,
 		fmt.Sprintf("session expected len(blockOrder) = %d but got %d\n", expected, len(s.History.BlockOrder)))
@@ -168,28 +169,53 @@ func testBlockOrder(t *testing.T, s *Session, expected, additional int) {
 	}
 }
 
-func testSession(t *testing.T, peer string, docID, doc string) *Session {
-	ch := NewHistory(docID, doc1, NewMemoryStorage())
+func clearHistoryCache(histories ...*History) {
+	for _, h := range histories {
+		h.Blocks = make(map[Sha]*OpBlock)
+		h.PendingOn = make(map[Sha]doc.Set[Sha])
+		h.PendingBlocks = make(map[Sha]*OpBlock)
+		h.LCAs = make(map[Twosha]*LCA)
+		h.BlockOrder = h.BlockOrder[:0]
+		h.Blocks[h.Source.Hash] = h.Source
+		for _, blk := range h.Latest {
+			h.Blocks[blk.Hash] = blk
+		}
+	}
+}
+
+func testSession(t *testing.T, peer string, doc string) *Session {
+	ch := NewHistory(NewMemoryStorage(doc), doc1)
 	s := NewSession(peer, ch)
 	testBlockOrder(t, s, 1, 1)
+	clearHistoryCache(ch)
 	return s
 }
 
 func TestEditing(t *testing.T) {
-	s1 := testSession(t, "peer1", "doc1", doc1)
-	s2 := testSession(t, "peer2", "doc1", doc1)
+	s1 := testSession(t, "peer1", doc1)
+	s2 := testSession(t, "peer2", doc1)
 	testEqual(t, s1.History.Source.Hash, s2.History.Source.Hash, "source hashes are not identical")
 	d1, d2 := docs(t)
 	doc1 := d1.String()
 	doc2 := d2.String()
+	clearHistoryCache(s1.History, s2.History)
 	commitEdits(t, s1, d1, []Replacement{})
+	clearHistoryCache(s1.History, s2.History)
 	testBlockOrder(t, s1, 2, 1)
+	clearHistoryCache(s1.History, s2.History)
 	commitEdits(t, s2, d2, []Replacement{})
+	clearHistoryCache(s1.History, s2.History)
 	testBlockOrder(t, s2, 2, 1)
+	clearHistoryCache(s1.History, s2.History)
 	blk1 := outgoing(s1)
+	clearHistoryCache(s1.History, s2.History)
 	blk2 := outgoing(s2)
+	clearHistoryCache(s1.History, s2.History)
 	addBlock(t, s1, blk2, doc2)
+	clearHistoryCache(s1.History, s2.History)
 	testCommit(t, s1, doc1, docMerged)
+	clearHistoryCache(s1.History, s2.History)
 	addBlock(t, s2, blk1, doc1)
+	clearHistoryCache(s1.History, s2.History)
 	testCommit(t, s2, doc2, docMerged)
 }

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	doc "github.com/leisure-tools/document"
+	ft "github.com/leisure-tools/lazyfingertree"
 )
 
 var ErrCollab = errors.New("Collaboration error")
@@ -26,27 +27,31 @@ type UUID [16]byte
 
 // History of a document
 type History struct {
-	DocID         UUID
 	Source        *OpBlock
 	Latest        map[string]*OpBlock // peer -> block
 	Blocks        map[Sha]*OpBlock
-	PendingOn     map[Sha]doc.Set[*OpBlock]
+	PendingOn     map[Sha]doc.Set[Sha]
 	PendingBlocks map[Sha]*OpBlock
 	Storage       DocStorage
 	LCAs          map[Twosha]*LCA // 2-block LCAs
 	BlockOrder    []Sha
-	DirtyBlocks   []*OpBlock // stored at the end of a commit
 }
 
 type DocStorage interface {
+	GetBlockCount() int
+	GetSource() *OpBlock
+	GetLatest() map[string]*OpBlock
+	SetLatest(peer string, latest *OpBlock)
 	GetBlock(hash Sha) *OpBlock
 	HasBlock(hash Sha) bool
-	StoreBlocks(blks []*OpBlock) // removes from pending and pendingOn
+	StoreBlock(blks *OpBlock) // removes from pending and pendingOn
+	AddChild(blk *OpBlock, child Sha)
 	HasPendingBlock(hash Sha) bool
 	GetPendingBlock(hash Sha) *OpBlock
 	StorePendingBlock(*OpBlock)
-	StoreParameters(latest map[string]Sha, pendingOps []Replacement)
-	PendingOn(blk Sha, pendingBlock *OpBlock)
+	GetPendingOn(hash Sha) []Sha
+	StorePendingOn(blk Sha, pendingBlock *OpBlock)
+	GetBlockDoc(hash Sha) string
 	StoreBlockDoc(blk *OpBlock)
 }
 
@@ -94,9 +99,11 @@ type LCA struct {
 
 // this is the default storage
 type MemoryStorage struct {
+	sourceBlock   *OpBlock
+	latest        map[string]Sha
 	blocks        map[Sha]*OpBlock
 	pendingBlocks map[Sha]*OpBlock
-	pendingOn     map[Sha]doc.Set[*OpBlock]
+	pendingOn     map[Sha]doc.Set[Sha]
 	blockDocs     map[Sha]string
 }
 
@@ -104,13 +111,36 @@ type MemoryStorage struct {
 /// basic storage
 ///
 
-func NewMemoryStorage() *MemoryStorage {
+func NewMemoryStorage(source string) *MemoryStorage {
+	src := newOpBlock("", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: source}}, 0, 0)
 	return &MemoryStorage{
-		blocks:        map[Sha]*OpBlock{},
+		sourceBlock:   src,
+		latest:        map[string]Sha{},
+		blocks:        map[Sha]*OpBlock{src.Hash: src},
 		pendingBlocks: map[Sha]*OpBlock{},
-		pendingOn:     map[Sha]doc.Set[*OpBlock]{},
+		pendingOn:     map[Sha]doc.Set[Sha]{},
 		blockDocs:     map[Sha]string{},
 	}
+}
+
+func (st *MemoryStorage) GetBlockCount() int {
+	return len(st.blocks)
+}
+
+func (st *MemoryStorage) GetSource() *OpBlock {
+	return st.sourceBlock
+}
+
+func (st *MemoryStorage) GetLatest() map[string]*OpBlock {
+	latest := map[string]*OpBlock{}
+	for peer, hash := range st.latest {
+		latest[peer] = st.GetBlock(hash)
+	}
+	return latest
+}
+
+func (st *MemoryStorage) SetLatest(peer string, blk *OpBlock) {
+	st.latest[peer] = blk.Hash
 }
 
 func (st *MemoryStorage) HasBlock(hash Sha) bool {
@@ -121,12 +151,15 @@ func (st *MemoryStorage) GetBlock(hash Sha) *OpBlock {
 	return st.blocks[hash]
 }
 
-func (st *MemoryStorage) StoreBlocks(blks []*OpBlock) {
-	for _, blk := range blks {
-		st.blocks[blk.Hash] = blk.clean()
-		delete(st.pendingBlocks, blk.Hash)
-		delete(st.pendingOn, blk.Hash)
-	}
+func (st *MemoryStorage) AddChild(blk *OpBlock, child Sha) {
+	b := st.blocks[blk.Hash]
+	b.children = append(b.children, child)
+}
+
+func (st *MemoryStorage) StoreBlock(blk *OpBlock) {
+	st.blocks[blk.Hash] = blk.Clean()
+	delete(st.pendingBlocks, blk.Hash)
+	delete(st.pendingOn, blk.Hash)
 }
 
 func (st *MemoryStorage) HasPendingBlock(hash Sha) bool {
@@ -141,16 +174,21 @@ func (st *MemoryStorage) StorePendingBlock(blk *OpBlock) {
 	st.pendingBlocks[blk.Hash] = blk
 }
 
-func (st *MemoryStorage) StoreParameters(latest map[string]Sha, pendingOps []Replacement) {
-}
-
 func (st *MemoryStorage) Dirty(blk *OpBlock) {}
 
-func (st *MemoryStorage) PendingOn(hash Sha, pendingBlock *OpBlock) {
+func (st *MemoryStorage) StorePendingOn(hash Sha, pendingBlock *OpBlock) {
 	if st.pendingOn[hash] == nil {
-		st.pendingOn[hash] = doc.Set[*OpBlock]{}
+		st.pendingOn[hash] = doc.Set[Sha]{}
 	}
-	st.pendingOn[hash].Add(pendingBlock)
+	st.pendingOn[hash].Add(pendingBlock.Hash)
+}
+
+func (st *MemoryStorage) GetPendingOn(hash Sha) []Sha {
+	return st.pendingOn[hash].ToSlice()
+}
+
+func (st *MemoryStorage) GetBlockDoc(hash Sha) string {
+	return st.blockDocs[hash]
 }
 
 func (st *MemoryStorage) StoreBlockDoc(blk *OpBlock) {
@@ -169,20 +207,19 @@ func newOpBlock(peer string, nonce int, parents []Sha, repl []Replacement, selOf
 		Replacements:    repl,
 		SelectionOffset: selOff,
 		SelectionLength: selLen,
-		children:        make([]Sha, 0, 4),
 	}
 	blk.computeHash()
 	blk.descendants = doc.NewSet(blk.Hash)
 	return blk
 }
 
-func (blk *OpBlock) clean() *OpBlock {
+func (blk *OpBlock) Clean() *OpBlock {
 	return &OpBlock{
 		Hash:            blk.Hash,
 		Peer:            blk.Peer,
 		Nonce:           blk.Nonce,
-		Parents:         blk.Parents,
-		Replacements:    blk.Replacements,
+		Parents:         ft.Dup(blk.Parents),
+		Replacements:    ft.Dup(blk.Replacements),
 		SelectionOffset: blk.SelectionOffset,
 		SelectionLength: blk.SelectionLength,
 	}
@@ -219,6 +256,9 @@ func (blk *OpBlock) addToDescendants(s *History, descendant Sha, seen doc.Set[Sh
 		return
 	}
 	seen.Add(blk.Hash)
+	if blk.descendants == nil {
+		blk.descendants = make(doc.Set[Sha])
+	}
 	blk.descendants.Add(descendant)
 	for _, parent := range blk.Parents {
 		s.getBlock(parent).addToDescendants(s, descendant, seen)
@@ -252,14 +292,20 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 	if blk.blockDoc == nil && blk.isSource() {
 		blk.blockDoc = doc.NewDocument(blk.Replacements[0].Text)
 	} else if blk.blockDoc == nil {
-		blk.blockDoc = blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze()
+		d := s.Storage.GetBlockDoc(blk.Hash)
+		if d != "" {
+			blk.blockDoc = doc.NewDocument(d)
+		} else {
+			blk.blockDoc = blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze()
+			s.Storage.StoreBlockDoc(blk)
+		}
 	}
 	return blk.blockDoc.Copy()
 }
 
 func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *document {
 	s.getBlockOrder()
-	if ancestor == blk {
+	if ancestor.Hash == blk.Hash {
 		return blk.GetDocument(s)
 	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
 		doc := ancestor.GetDocument(s).Copy()
@@ -279,21 +325,22 @@ func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *docum
 
 // blocks come in any order because of pubsub
 func (blk *OpBlock) checkPending(s *History) {
-	if s.PendingBlocks[blk.Hash] != nil {
+	if s.hasPendingBlock(blk.Hash) {
 		pending := false
 		delete(s.PendingBlocks, blk.Hash)
 		for _, hash := range blk.Parents {
 			if !s.hasBlock(hash) {
 				pending = true
 				if s.PendingOn[hash] == nil {
-					s.PendingOn[hash] = doc.Set[*OpBlock]{}
+					s.PendingOn[hash] = doc.Set[Sha]{}
 				}
-				s.PendingOn[hash].Add(blk)
+				s.PendingOn[hash].Add(blk.Hash)
+				s.Storage.StorePendingOn(hash, blk)
 			}
 		}
 		if !pending {
 			s.addBlock(blk)
-			for blk := range s.PendingOn[blk.Hash] {
+			for blk := range s.getPendingOn(blk.Hash) {
 				blk.checkPending(s)
 			}
 			delete(s.PendingOn, blk.Hash)
@@ -363,25 +410,24 @@ func NewSession(peer string, history *History) *Session {
 /// History
 ///
 
-func NewHistory(docId, text string, storage DocStorage) *History {
+func NewHistory(storage DocStorage, text string) *History {
 	src := newOpBlock("", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
 	src.order = 0
 	s := &History{
-		DocID:         newUUID(),
 		Source:        src,
 		Latest:        map[string]*OpBlock{},
 		Blocks:        map[Sha]*OpBlock{src.Hash: src},
 		PendingBlocks: map[Sha]*OpBlock{},
-		PendingOn:     map[Sha]doc.Set[*OpBlock]{},
+		PendingOn:     map[Sha]doc.Set[Sha]{},
 		Storage:       storage,
 		BlockOrder:    append(make([]Sha, 0, 8), src.Hash),
 	}
 	s.LCAs = map[Twosha]*LCA{}
-	storage.StoreBlocks([]*OpBlock{src})
+	storage.StoreBlock(src)
 	return s
 }
 
-func (s *History) recomputeOrder() {
+func (s *History) recomputeBlockOrder() {
 	// number blocks in breadth-first order from the source by children
 	cur := make([]Sha, 0, 8)
 	next := append(make([]Sha, 0, 8), s.Source.Hash)
@@ -468,8 +514,7 @@ func (s *History) getBlock(hash Sha) *OpBlock {
 		return s.Blocks[hash]
 	} else if s.PendingBlocks[hash] != nil {
 		return s.PendingBlocks[hash]
-	}
-	if blk := s.Storage.GetBlock(hash); blk != nil {
+	} else if blk := s.Storage.GetBlock(hash); blk != nil {
 		return blk
 	}
 	return s.Storage.GetPendingBlock(hash)
@@ -481,6 +526,24 @@ func (s *History) hasBlock(hash Sha) bool {
 
 func (s *History) hasPendingBlock(hash Sha) bool {
 	return s.PendingBlocks[hash] != nil || s.Storage.HasPendingBlock(hash)
+}
+
+func (s *History) getPendingOn(hash Sha) doc.Set[*OpBlock] {
+	if s.PendingOn[hash] == nil {
+		pending := s.Storage.GetPendingOn(hash)
+		if pending != nil {
+			blocks := make(doc.Set[Sha], len(pending))
+			for _, hash := range pending {
+				blocks.Add(hash)
+			}
+			s.PendingOn[hash] = blocks
+		}
+	}
+	result := make(doc.Set[*OpBlock], len(s.PendingOn[hash]))
+	for hash := range s.PendingOn[hash] {
+		result.Add(s.getBlock(hash))
+	}
+	return result
 }
 
 func sortHashes(hashes []Sha) {
@@ -518,17 +581,24 @@ func (s *Session) ReplaceAll(replacements []Replacement) {
 }
 
 func (s *History) addBlock(blk *OpBlock) {
+	if len(blk.Parents) == 0 {
+		panic("Adding block with not parents")
+	}
 	seen := doc.NewSet(blk.Hash)
+	s.Blocks[blk.Hash] = blk
+	s.Storage.StoreBlock(blk)
 	for _, parentHash := range blk.Parents {
 		parent := s.getBlock(parentHash)
 		parent.children = append(parent.children, blk.Hash)
+		s.Storage.AddChild(parent, blk.Hash)
 		parent.addToDescendants(s, blk.Hash, seen)
 	}
 	s.Latest[blk.Peer] = blk
-	s.Blocks[blk.Hash] = blk
+	s.Storage.SetLatest(blk.Peer, blk)
+	count := s.Storage.GetBlockCount()
 	for _, hash := range blk.Parents {
-		if s.getBlock(hash).order == len(s.Blocks)-1 {
-			blk.order = len(s.Blocks)
+		if s.getBlock(hash).order == count-1 {
+			blk.order = count
 			if s.BlockOrder != nil {
 				s.BlockOrder = append(s.BlockOrder, blk.Hash)
 			}
@@ -536,12 +606,12 @@ func (s *History) addBlock(blk *OpBlock) {
 		}
 	}
 	// none of the parents had order == len(s.blocks)-1
-	s.BlockOrder = nil
+	s.BlockOrder = s.BlockOrder[:0]
 }
 
 func (s *History) getBlockOrder() []Sha {
-	if s.BlockOrder == nil {
-		s.recomputeOrder()
+	if len(s.BlockOrder) == 0 {
+		s.recomputeBlockOrder()
 	}
 	return s.BlockOrder
 }
@@ -552,10 +622,11 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 		return nil
 	}
 	prev := blk.peerParent(s)
-	if prev == s.Source && s.Latest[blk.Peer] != nil || prev != s.Source && prev.peerChild(s) != nil {
+	if prev.isSource() && s.Latest[blk.Peer] != nil || !prev.isSource() && prev.peerChild(s) != nil {
 		return ErrDivergentBlock
 	}
 	s.PendingBlocks[blk.Hash] = blk
+	s.Storage.StorePendingBlock(blk)
 	blk.checkPending(s)
 	return nil
 }
@@ -580,7 +651,7 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 	repl := make([]Replacement, len(s.PendingOps))
 	copy(repl, s.PendingOps)
 	s.PendingOps = s.PendingOps[:0]
-	blk := newOpBlock(s.Peer, len(s.History.Blocks), s.History.latestHashes(), repl, selOff, selLen)
+	blk := newOpBlock(s.Peer, s.History.Storage.GetBlockCount(), s.History.latestHashes(), repl, selOff, selLen)
 	s.History.addBlock(blk)
 	return blk.edits(s.History)
 }
