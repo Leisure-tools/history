@@ -49,7 +49,7 @@ func failIfErrNow(t *testing.T, err any) {
 	}
 }
 
-const doc1 = `line one
+const docString1 = `line one
 line two
 line three`
 
@@ -71,16 +71,16 @@ func index(str string, line, col int) int {
 }
 
 func docONE(t *testing.T, peer string) *document {
-	d := doc.NewDocument(doc1)
-	replace(t, d, peer, index(doc1, 0, 5), 3, "ONE")
-	replace(t, d, peer, index(doc1, 2, 10), 0, "\nline four")
+	d := doc.NewDocument(docString1)
+	replace(t, d, peer, index(docString1, 0, 5), 3, "ONE")
+	replace(t, d, peer, index(docString1, 2, 10), 0, "\nline four")
 	return d
 }
 
 func docTWO(t *testing.T, peer string) *document {
-	d := doc.NewDocument(doc1)
-	replace(t, d, peer, index(doc1, 1, 5), 3, "TWO")
-	replace(t, d, peer, index(doc1, 2, 10), 0, "\nline five")
+	d := doc.NewDocument(docString1)
+	replace(t, d, peer, index(docString1, 1, 5), 3, "TWO")
+	replace(t, d, peer, index(docString1, 2, 10), 0, "\nline five")
 	return d
 }
 
@@ -100,7 +100,7 @@ func TestMerge(t *testing.T) {
 	for _, r := range b.ReverseEdits() {
 		replace(t, revDoc, "peer1", r.Offset, r.Length, r.Text)
 	}
-	testEqual(t, revDoc.String(), doc1, "unsuccessful reversal")
+	testEqual(t, revDoc.String(), docString1, "unsuccessful reversal")
 }
 
 func commitEdits(t *testing.T, s *Session, doc *document, expected []Replacement) {
@@ -118,7 +118,7 @@ func commitReplacements(t *testing.T, s *Session, edits []Replacement, expected 
 		prev = s.History.Source
 	}
 	anc := latest.getDocumentForAncestor(s.History, prev)
-	testEqualRepls(t, anc.Edits(), edits, "ancestor edits did not match")
+	testEqualRepls(t, anc.Edits(), expected, "ancestor edits did not match")
 }
 
 func addBlock(t *testing.T, s *Session, blk *OpBlock, expected string) {
@@ -184,7 +184,7 @@ func clearHistoryCache(histories ...*History) {
 }
 
 func testSession(t *testing.T, peer string, doc string) *Session {
-	ch := NewHistory(NewMemoryStorage(doc), doc1)
+	ch := NewHistory(NewMemoryStorage(doc), docString1)
 	s := NewSession(peer, ch)
 	testBlockOrder(t, s, 1, 1)
 	clearHistoryCache(ch)
@@ -192,24 +192,73 @@ func testSession(t *testing.T, peer string, doc string) *Session {
 }
 
 func TestEditing(t *testing.T) {
-	s1 := testSession(t, "peer1", doc1)
-	s2 := testSession(t, "peer2", doc1)
-	testEqual(t, s1.History.Source.Hash, s2.History.Source.Hash, "source hashes are not identical")
-	d1, d2 := docs(t)
-	doc1 := d1.String()
+	s1 := testSession(t, "peer1", docString1)
+	s2 := testSession(t, "peer2", docString1)
+	d1 := doc.NewDocument(docString1)
+	d2 := docTWO(t, "peer2")
 	doc2 := d2.String()
+	commitEdits(t, s2, d2, []Replacement{
+		{
+			Offset: 14,
+			Length: 3,
+			Text:   "TWO"},
+		{
+			Offset: 28,
+			Length: 0,
+			Text: `
+line five`},
+	})
+	blk2 := outgoing(s2)
+	addBlock(t, s1, blk2, doc2)
+	commitReplacements(t, s1, []Replacement{}, []Replacement{
+		{
+			Offset: 14,
+			Length: 3,
+			Text:   "TWO"},
+		{
+			Offset: 28,
+			Length: 0,
+			Text: `
+line five`},
+	})
+	s1 = testSession(t, "peer1", docString1)
+	s2 = testSession(t, "peer2", docString1)
+	testEqual(t, s1.History.Source.Hash, s2.History.Source.Hash, "source hashes are not identical")
+	d1, d2 = docs(t)
+	doc1 := d1.String()
+	doc2 = d2.String()
 	clearHistoryCache(s1.History, s2.History)
-	commitEdits(t, s1, d1, []Replacement{})
+	commitEdits(t, s1, d1, []Replacement{
+		{
+			Offset: 5,
+			Length: 3,
+			Text:   "ONE"},
+		{
+			Offset: 28,
+			Length: 0,
+			Text: `
+line four`},
+	})
 	clearHistoryCache(s1.History, s2.History)
 	testBlockOrder(t, s1, 2, 1)
 	clearHistoryCache(s1.History, s2.History)
-	commitEdits(t, s2, d2, []Replacement{})
+	commitEdits(t, s2, d2, []Replacement{
+		{
+			Offset: 14,
+			Length: 3,
+			Text:   "TWO"},
+		{
+			Offset: 28,
+			Length: 0,
+			Text: `
+line five`},
+	})
 	clearHistoryCache(s1.History, s2.History)
 	testBlockOrder(t, s2, 2, 1)
 	clearHistoryCache(s1.History, s2.History)
 	blk1 := outgoing(s1)
 	clearHistoryCache(s1.History, s2.History)
-	blk2 := outgoing(s2)
+	blk2 = outgoing(s2)
 	clearHistoryCache(s1.History, s2.History)
 	addBlock(t, s1, blk2, doc2)
 	clearHistoryCache(s1.History, s2.History)

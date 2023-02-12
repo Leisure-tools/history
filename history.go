@@ -308,14 +308,7 @@ func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *docum
 	if ancestor.Hash == blk.Hash {
 		return blk.GetDocument(s)
 	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
-		doc := ancestor.GetDocument(s).Copy()
-		for _, hash := range blk.Parents {
-			parent := s.getBlock(hash)
-			if parent != ancestor {
-				parentDoc := parent.getDocumentForAncestor(s, ancestor)
-				doc.Merge(parentDoc)
-			}
-		}
+		doc := s.GetDocumentForBlocks(ancestor, blk.Parents)
 		blk.applyTo(doc)
 		blk.documentAncestor = ancestor.Hash
 		blk.document = doc
@@ -366,7 +359,12 @@ func (blk *OpBlock) edits(s *History) ([]Replacement, int, int) {
 	// + get ancestor -> merged
 	s.getBlockOrder()
 	parent := blk.peerParent(s)
-	ancestor := s.lca(blk.Parents)
+	parents := blk.Parents
+	if parent == s.Source {
+		parents = append(make([]Sha, 0, len(parents)+1), blk.Parents...)
+		parents = append(parents, s.Source.Hash)
+	}
+	ancestor := s.lca(parents)
 	parentToCurrent := parent.GetDocument(s)
 	blk.applyTo(parentToCurrent)
 	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)
@@ -425,6 +423,24 @@ func NewHistory(storage DocStorage, text string) *History {
 	s.LCAs = map[Twosha]*LCA{}
 	storage.StoreBlock(src)
 	return s
+}
+
+func (s *History) GetLatestDocument() *document {
+	latest := s.LatestHashes()
+	ancestor := s.lca(latest)
+	return s.GetDocumentForBlocks(ancestor, latest)
+}
+
+func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *document {
+	doc := ancestor.GetDocument(s).Copy()
+	for _, hash := range hashes {
+		parent := s.getBlock(hash)
+		if parent != ancestor {
+			parentDoc := parent.getDocumentForAncestor(s, ancestor)
+			doc.Merge(parentDoc)
+		}
+	}
+	return doc
 }
 
 func (s *History) recomputeBlockOrder() {
@@ -553,7 +569,7 @@ func sortHashes(hashes []Sha) {
 }
 
 // sorted hashes of the most recent blocks in the known chains
-func (s *History) latestHashes() []Sha {
+func (s *History) LatestHashes() []Sha {
 	if len(s.Latest) == 0 {
 		return []Sha{s.Source.Hash}
 	}
@@ -631,27 +647,32 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 	return nil
 }
 
+func SameHashes(a, b []Sha) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, hashA := range a {
+		if bytes.Compare(hashA[:], b[i][:]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 	latest := s.History.Latest[s.Peer]
 	if latest != nil && len(s.PendingOps) == 0 {
-		hashes := s.History.latestHashes()
-		same := len(hashes) == len(latest.Parents)
-		for i, hash := range hashes {
-			if bytes.Compare(hash[:], latest.Parents[i][:]) != 0 {
-				same = false
-				break
-			}
-		}
-		if same {
+		hashes := s.History.LatestHashes()
+		if SameHashes(hashes, latest.Parents) {
 			return []Replacement{}, selOff, selLen
 		}
 	}
 	repl := make([]Replacement, len(s.PendingOps))
 	copy(repl, s.PendingOps)
 	s.PendingOps = s.PendingOps[:0]
-	blk := newOpBlock(s.Peer, s.History.Storage.GetBlockCount(), s.History.latestHashes(), repl, selOff, selLen)
+	blk := newOpBlock(s.Peer, s.History.Storage.GetBlockCount(), s.History.LatestHashes(), repl, selOff, selLen)
 	s.History.addBlock(blk)
 	return blk.edits(s.History)
 }
