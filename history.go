@@ -25,6 +25,8 @@ type Sha = [sha256.Size]byte
 type Twosha = [sha256.Size * 2]byte
 type UUID [16]byte
 
+var EMPTY_SHA Sha
+
 // History of a document
 type History struct {
 	Source        *OpBlock
@@ -51,14 +53,15 @@ type DocStorage interface {
 	StorePendingBlock(*OpBlock)
 	GetPendingOn(hash Sha) []Sha
 	StorePendingOn(blk Sha, pendingBlock *OpBlock)
-	GetBlockDoc(hash Sha) string
-	StoreBlockDoc(blk *OpBlock)
+	GetDocument(docHash Sha) string
+	StoreDocument(doc string)
 }
 
+// temporary connection information, not persisted to storage
 type Session struct {
+	*History
 	Peer       string
 	PendingOps []Replacement
-	History    *History
 }
 
 // UUIDs
@@ -84,6 +87,7 @@ type OpBlock struct {
 	document         *document // simple cache to speed up successive document edits
 	documentAncestor Sha
 	blockDoc         *document // frozen document for this block
+	blockDocHash     Sha
 	children         []Sha
 	descendants      doc.Set[Sha]
 	order            int // block's index in the session's blockOrder list
@@ -104,7 +108,7 @@ type MemoryStorage struct {
 	blocks        map[Sha]*OpBlock
 	pendingBlocks map[Sha]*OpBlock
 	pendingOn     map[Sha]doc.Set[Sha]
-	blockDocs     map[Sha]string
+	documents     map[Sha]string
 }
 
 ///
@@ -119,7 +123,7 @@ func NewMemoryStorage(source string) *MemoryStorage {
 		blocks:        map[Sha]*OpBlock{src.Hash: src},
 		pendingBlocks: map[Sha]*OpBlock{},
 		pendingOn:     map[Sha]doc.Set[Sha]{},
-		blockDocs:     map[Sha]string{},
+		documents:     map[Sha]string{},
 	}
 }
 
@@ -187,12 +191,12 @@ func (st *MemoryStorage) GetPendingOn(hash Sha) []Sha {
 	return st.pendingOn[hash].ToSlice()
 }
 
-func (st *MemoryStorage) GetBlockDoc(hash Sha) string {
-	return st.blockDocs[hash]
+func (st *MemoryStorage) GetDocument(docHash Sha) string {
+	return st.documents[docHash]
 }
 
-func (st *MemoryStorage) StoreBlockDoc(blk *OpBlock) {
-	st.blockDocs[blk.Hash] = blk.blockDoc.String()
+func (st *MemoryStorage) StoreDocument(doc string) {
+	st.documents[sha256.Sum256([]byte(doc))] = doc
 }
 
 ///
@@ -261,25 +265,26 @@ func (blk *OpBlock) addToDescendants(s *History, descendant Sha, seen doc.Set[Sh
 	}
 	blk.descendants.Add(descendant)
 	for _, parent := range blk.Parents {
-		s.getBlock(parent).addToDescendants(s, descendant, seen)
+		s.GetBlock(parent).addToDescendants(s, descendant, seen)
 	}
 }
 
-// parent for the same peer, or source block if there is none
-func (blk *OpBlock) peerParent(s *History) *OpBlock {
-	for _, hash := range blk.Parents {
-		parent := s.getBlock(hash)
-		if parent.Peer == blk.Peer {
-			return parent
+// most recent ancestor for the peer, or source block if there is none
+func (blk *OpBlock) peerParent(h *History) *OpBlock {
+	order := h.getBlockOrder()
+	for i := blk.order - 1; i >= 0; i-- {
+		oblk := h.GetBlock(order[i])
+		if oblk.Peer == blk.Peer {
+			return oblk
 		}
 	}
-	return s.Source
+	return h.Source
 }
 
 // parent for the same peer
 func (blk *OpBlock) peerChild(s *History) *OpBlock {
 	for _, hash := range blk.children {
-		child := s.getBlock(hash)
+		child := s.GetBlock(hash)
 		if child.Peer == blk.Peer {
 			return child
 		}
@@ -287,17 +292,25 @@ func (blk *OpBlock) peerChild(s *History) *OpBlock {
 	return nil
 }
 
+func (blk *OpBlock) setBlockDoc(bdoc *document) {
+	blk.blockDoc = bdoc
+	blk.blockDocHash = sha256.Sum256([]byte(bdoc.String()))
+}
+
 // get the frozen document for this block
 func (blk *OpBlock) GetDocument(s *History) *document {
 	if blk.blockDoc == nil && blk.isSource() {
-		blk.blockDoc = doc.NewDocument(blk.Replacements[0].Text)
+		blk.setBlockDoc(doc.NewDocument(blk.Replacements[0].Text))
 	} else if blk.blockDoc == nil {
-		d := s.Storage.GetBlockDoc(blk.Hash)
+		d := ""
+		if blk.blockDocHash != EMPTY_SHA {
+			d = s.Storage.GetDocument(blk.blockDocHash)
+		}
 		if d != "" {
-			blk.blockDoc = doc.NewDocument(d)
+			blk.setBlockDoc(doc.NewDocument(d))
 		} else {
-			blk.blockDoc = blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze()
-			s.Storage.StoreBlockDoc(blk)
+			blk.setBlockDoc(blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze())
+			s.Storage.StoreDocument(blk.blockDoc.String())
 		}
 	}
 	return blk.blockDoc.Copy()
@@ -352,23 +365,27 @@ func (blk *OpBlock) applyTo(doc *document) {
 // this is for when the peer just committed the replacements, so
 // it's document state is prevBlock + replacements. Compute the
 // edits necessary to transform it to the merged document.
-func (blk *OpBlock) edits(s *History) ([]Replacement, int, int) {
+func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	// to get to the merged doc from peer's current doc:
 	// reverse(parent->current)
 	// + reverse(ancestor -> parent)
 	// + get ancestor -> merged
-	s.getBlockOrder()
-	parent := blk.peerParent(s)
+	h.getBlockOrder()
+	parent := blk.peerParent(h)
 	parents := blk.Parents
-	if parent == s.Source {
+	if parent == h.Source {
+		parents = make([]Sha, 0, len(parents)+1)
 		parents = append(make([]Sha, 0, len(parents)+1), blk.Parents...)
-		parents = append(parents, s.Source.Hash)
+		parents = append(parents, h.Source.Hash)
 	}
-	ancestor := s.lca(parents)
-	parentToCurrent := parent.GetDocument(s)
+	ancestor := h.lca(parents)
+	if parent.order < ancestor.order {
+		ancestor = parent
+	}
+	parentToCurrent := parent.GetDocument(h)
 	blk.applyTo(parentToCurrent)
-	ancestorToParent := parent.getDocumentForAncestor(s, ancestor)
-	ancestorToMerged := blk.getDocumentForAncestor(s, ancestor)
+	ancestorToParent := parent.getDocumentForAncestor(h, ancestor)
+	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor)
 	peerDoc := parentToCurrent.Freeze()
 	selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
 	peerDoc.Apply(blk.Peer, parentToCurrent.ReverseEdits())
@@ -425,6 +442,10 @@ func NewHistory(storage DocStorage, text string) *History {
 	return s
 }
 
+func (s *History) GetDocument(hash Sha) string {
+	return s.Storage.GetDocument(hash)
+}
+
 func (s *History) GetLatestDocument() *document {
 	latest := s.LatestHashes()
 	ancestor := s.lca(latest)
@@ -434,7 +455,7 @@ func (s *History) GetLatestDocument() *document {
 func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *document {
 	doc := ancestor.GetDocument(s).Copy()
 	for _, hash := range hashes {
-		parent := s.getBlock(hash)
+		parent := s.GetBlock(hash)
 		if parent != ancestor {
 			parentDoc := parent.getDocumentForAncestor(s, ancestor)
 			doc.Merge(parentDoc)
@@ -456,7 +477,7 @@ func (s *History) recomputeBlockOrder() {
 				continue
 			}
 			seen.Add(hash)
-			blk := s.getBlock(hash)
+			blk := s.GetBlock(hash)
 			blk.order = len(s.BlockOrder)
 			s.BlockOrder = append(s.BlockOrder, hash)
 			sortHashes(blk.children)
@@ -478,11 +499,11 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 	key := newTwosha(blkA.Hash, blkB.Hash)
 	lca := s.LCAs[key]
 	if lca != nil && lca.blkA == blkA.Hash && blkA.order == lca.orderA && blkB.order == lca.orderB {
-		return s.getBlock(lca.ancestor)
+		return s.GetBlock(lca.ancestor)
 	}
 	// start with the lowest block
 	for i := blkA.order; i >= 0; i-- {
-		anc := s.getBlock(s.BlockOrder[i])
+		anc := s.GetBlock(s.BlockOrder[i])
 		if anc.descendants.Has(blkA.Hash) && anc.descendants.Has(blkB.Hash) {
 			s.LCAs[key] = &LCA{
 				blkA:     blkA.Hash,
@@ -501,7 +522,7 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 func (s *History) lca(hashes []Sha) *OpBlock {
 	blocks := make([]*OpBlock, 0, len(hashes))
 	for _, block := range hashes {
-		blocks = append(blocks, s.getBlock(block))
+		blocks = append(blocks, s.GetBlock(block))
 	}
 	if len(blocks) == 1 {
 		return blocks[0]
@@ -514,7 +535,7 @@ func (s *History) lca(hashes []Sha) *OpBlock {
 	// (hashes tends to have sorted shas, which are reasonably random)
 LCA:
 	for index := s.lca2(blocks[0], blocks[1]).order; index >= 0; index-- {
-		anc := s.getBlock(s.BlockOrder[index])
+		anc := s.GetBlock(s.BlockOrder[index])
 		for _, hash := range hashes {
 			if !anc.descendants.Has(hash) {
 				continue LCA
@@ -525,7 +546,7 @@ LCA:
 	return nil
 }
 
-func (s *History) getBlock(hash Sha) *OpBlock {
+func (s *History) GetBlock(hash Sha) *OpBlock {
 	if s.Blocks[hash] != nil {
 		return s.Blocks[hash]
 	} else if s.PendingBlocks[hash] != nil {
@@ -557,7 +578,7 @@ func (s *History) getPendingOn(hash Sha) doc.Set[*OpBlock] {
 	}
 	result := make(doc.Set[*OpBlock], len(s.PendingOn[hash]))
 	for hash := range s.PendingOn[hash] {
-		result.Add(s.getBlock(hash))
+		result.Add(s.GetBlock(hash))
 	}
 	return result
 }
@@ -573,13 +594,11 @@ func (s *History) LatestHashes() []Sha {
 	if len(s.Latest) == 0 {
 		return []Sha{s.Source.Hash}
 	}
-	var hashes []Sha
-	hashes = make([]Sha, len(s.Latest))
-	pos := 0
-	for peer := range s.Latest {
-		hashes[pos] = s.Latest[peer].Hash
-		pos++
+	hashSet := doc.NewSet[Sha]()
+	for _, blk := range s.Latest {
+		hashSet.Add(blk.Hash)
 	}
+	hashes := hashSet.ToSlice()
 	sortHashes(hashes)
 	return hashes
 }
@@ -604,7 +623,7 @@ func (s *History) addBlock(blk *OpBlock) {
 	s.Blocks[blk.Hash] = blk
 	s.Storage.StoreBlock(blk)
 	for _, parentHash := range blk.Parents {
-		parent := s.getBlock(parentHash)
+		parent := s.GetBlock(parentHash)
 		parent.children = append(parent.children, blk.Hash)
 		s.Storage.AddChild(parent, blk.Hash)
 		parent.addToDescendants(s, blk.Hash, seen)
@@ -613,7 +632,7 @@ func (s *History) addBlock(blk *OpBlock) {
 	s.Storage.SetLatest(blk.Peer, blk)
 	count := s.Storage.GetBlockCount()
 	for _, hash := range blk.Parents {
-		if s.getBlock(hash).order == count-1 {
+		if s.GetBlock(hash).order == count-1 {
 			blk.order = count
 			if s.BlockOrder != nil {
 				s.BlockOrder = append(s.BlockOrder, blk.Hash)
@@ -659,21 +678,62 @@ func SameHashes(a, b []Sha) bool {
 	return true
 }
 
+func (s *Session) latestNonTrivialHashes() []Sha {
+	latestHashes := s.LatestHashes()
+	parentSet := doc.NewSet(latestHashes...)
+	// for non-peer blocks, replace each null block with its first non-null ancestor
+	for _, b := range latestHashes {
+		blk := s.GetBlock(b)
+		if blk.Peer != s.Peer {
+			for len(blk.Replacements) == 0 && len(blk.Parents) == 1 {
+				parentSet.Remove(blk.Hash)
+				blk = s.GetBlock(blk.Parents[0])
+				parentSet.Add(blk.Hash)
+			}
+		}
+	}
+	return parentSet.ToSlice()
+}
+
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
-	latest := s.History.Latest[s.Peer]
-	if latest != nil && len(s.PendingOps) == 0 {
-		hashes := s.History.LatestHashes()
-		if SameHashes(hashes, latest.Parents) {
+	parent := s.Latest[s.Peer]
+	latestHashes := s.LatestHashes()
+	if parent != nil && len(s.PendingOps) == 0 {
+		if SameHashes(latestHashes, parent.Parents) {
+			// no changes
 			return []Replacement{}, selOff, selLen
 		}
 	}
-	repl := make([]Replacement, len(s.PendingOps))
-	copy(repl, s.PendingOps)
+	//latestHashes = s.latestNonTrivialHashes()
+	excluded := doc.Set[Sha]{}
+	for i, p := range latestHashes {
+		if !excluded.Has(p) {
+			parent := s.GetBlock(p)
+			for _, c := range latestHashes[i+1:] {
+				if !excluded.Has(c) {
+					child := s.GetBlock(c)
+					if child.descendants.Has(p) {
+						excluded.Add(c)
+					} else if parent.descendants.Has(c) {
+						excluded.Add(p)
+					}
+				}
+			}
+		}
+	}
+	parents := make([]Sha, 0, len(latestHashes)-len(excluded))
+	for _, p := range latestHashes {
+		if !excluded.Has(p) {
+			parents = append(parents, p)
+		}
+	}
+	sortHashes(parents)
+	repl := ft.Dup(s.PendingOps)
 	s.PendingOps = s.PendingOps[:0]
-	blk := newOpBlock(s.Peer, s.History.Storage.GetBlockCount(), s.History.LatestHashes(), repl, selOff, selLen)
-	s.History.addBlock(blk)
+	blk := newOpBlock(s.Peer, s.Storage.GetBlockCount(), parents, repl, selOff, selLen)
+	s.addBlock(blk)
 	return blk.edits(s.History)
 }
 
