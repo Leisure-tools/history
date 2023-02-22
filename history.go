@@ -217,6 +217,14 @@ func newOpBlock(peer string, nonce int, parents []Sha, repl []Replacement, selOf
 	return blk
 }
 
+func (blk *OpBlock) GetDescendants() doc.Set[Sha] {
+	return blk.descendants
+}
+
+func (blk *OpBlock) GetOrder() int {
+	return blk.order
+}
+
 func (blk *OpBlock) Clean() *OpBlock {
 	return &OpBlock{
 		Hash:            blk.Hash,
@@ -271,7 +279,7 @@ func (blk *OpBlock) addToDescendants(s *History, descendant Sha, seen doc.Set[Sh
 
 // most recent ancestor for the peer, or source block if there is none
 func (blk *OpBlock) peerParent(h *History) *OpBlock {
-	order := h.getBlockOrder()
+	order := h.GetBlockOrder()
 	for i := blk.order - 1; i >= 0; i-- {
 		oblk := h.GetBlock(order[i])
 		if oblk.Peer == blk.Peer {
@@ -317,7 +325,7 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 }
 
 func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *document {
-	s.getBlockOrder()
+	s.GetBlockOrder()
 	if ancestor.Hash == blk.Hash {
 		return blk.GetDocument(s)
 	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
@@ -370,7 +378,7 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	// reverse(parent->current)
 	// + reverse(ancestor -> parent)
 	// + get ancestor -> merged
-	h.getBlockOrder()
+	h.GetBlockOrder()
 	parent := blk.peerParent(h)
 	parents := blk.Parents
 	if parent == h.Source {
@@ -491,7 +499,7 @@ func (s *History) recomputeBlockOrder() {
 // these are cached; when new blocks come in from outside,
 // they can cause renumbering, which clears the cache
 func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
-	s.getBlockOrder()
+	s.GetBlockOrder()
 	// ensure blkA is the lower block
 	if blkB.order < blkA.order {
 		blkA, blkB = blkB, blkA
@@ -644,7 +652,7 @@ func (s *History) addBlock(blk *OpBlock) {
 	s.BlockOrder = s.BlockOrder[:0]
 }
 
-func (s *History) getBlockOrder() []Sha {
+func (s *History) GetBlockOrder() []Sha {
 	if len(s.BlockOrder) == 0 {
 		s.recomputeBlockOrder()
 	}

@@ -228,11 +228,11 @@ func outgoing(s *Session) *OpBlock {
 }
 
 func testBlockOrder(t myT, s *Session, expected, additional int) {
-	s.History.getBlockOrder()
+	s.History.GetBlockOrder()
 	lenBlocks := s.History.Storage.GetBlockCount()
 	testEqual(t, lenBlocks, expected,
 		fmt.Sprintf("session expected len(blocks) = %d but got %d\n", expected, lenBlocks))
-	lenOrder := len(s.History.getBlockOrder())
+	lenOrder := len(s.History.GetBlockOrder())
 	testEqual(t, lenOrder, expected,
 		fmt.Sprintf("session expected len(blockOrder) = %d but got %d\n", expected, len(s.History.BlockOrder)))
 	for _, hash := range s.History.BlockOrder[lenOrder-additional:] {
