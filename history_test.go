@@ -184,11 +184,11 @@ func commitReplacements(t myT, s *Session, edits []Replacement, expected []Repla
 	//repl, _, _ := s.Commit(0, 0)
 	//testEqualRepls(t, repl, expected, "replacements did not match after commit")
 	latest := s.History.Latest[s.Peer]
-	prev := latest.peerParent(s.History)
+	prev := latest.PeerParent(s.History)
 	if prev == nil {
 		prev = s.History.Source
 	}
-	anc := latest.getDocumentForAncestor(s.History, prev)
+	anc := latest.getDocumentForAncestor(s.History, prev, false)
 	testEqualRepls(t, anc.Edits(), expected, "ancestor edits did not match")
 }
 
@@ -196,13 +196,13 @@ func addBlock(t myT, s *Session, blk *OpBlock, expected string) {
 	l := s.History.Storage.GetBlockCount()
 	failIfErrNow(t, s.History.addIncomingBlock(blk))
 	testBlockOrder(t, s, l+1, 1)
-	prev := blk.peerParent(s.History)
+	prev := blk.PeerParent(s.History)
 	if prev == nil {
 		prev = s.History.Source
 	}
 	ancestor := s.History.lca(blk.Parents)
-	ancestorDoc := ancestor.getDocumentForAncestor(s.History, ancestor)
-	anc := s.History.Latest[blk.Peer].getDocumentForAncestor(s.History, prev)
+	ancestorDoc := ancestor.getDocumentForAncestor(s.History, ancestor, false)
+	anc := s.History.Latest[blk.Peer].getDocumentForAncestor(s.History, prev, false)
 	testEqual(t, anc.String(), expected, "ancestor doc did not match")
 	testEqual(t, anc.OriginalString(), ancestorDoc.String(), "ancestor doc did not match")
 }
@@ -534,10 +534,15 @@ func (p *testPeer) commit(anEdit, expected *edit) int {
 }
 
 func (p *testPeer) change(newEdit, expected *edit) *document {
+	l := p.latest()
 	doc := p.latest().GetDocument(p.history)
+	verbose(1, "EDIT: %+v\n", newEdit)
 	delta := p.commit(newEdit, expected)
 	verbose(1, "Delta: %d\n", delta)
 	newDoc := p.latest().GetDocument(p.history)
+	verbose(1, "DOC:\n%s\n", doc.Changes("  "))
+	verbose(1, "NEW-DOC:\n%s\n", newDoc.Changes("  "))
+	verbose(1, "OLD == NEW: %v\n", l == p.latest())
 	p.failIfNot(doc.String() != newDoc.String(), "document is unchanged")
 	p.failIfNot(len(doc.String())+delta == len(newDoc.String()), "new document for %s size is wrong, expected delta %d\n (%d) '%s' but got\n (%d) '%s'", p.Peer, delta, len(doc.String())+delta, doc.String(), len(newDoc.String()), newDoc.String())
 	return newDoc
@@ -545,10 +550,10 @@ func (p *testPeer) change(newEdit, expected *edit) *document {
 
 func (tp *twoPeers) change(offset, length int, text string) {
 	verbose(1, "replace: %d %d %s\n", offset, length, text)
-	verbose(1, "=========EMACS==========")
+	verbose(1, "=========EMACS==========\n")
 	newDoc1 := tp.p1.change(replacement(0, 0, offset, length, text), replacement(-1, -1))
 	verbose(1, "DOC:\n  '%s'\n", strings.Join(strings.Split(newDoc1.String(), "\n"), "'\n  '"))
-	verbose(1, "--------VS CODE---------")
+	verbose(1, "--------VS CODE---------\n")
 	newDoc2 := tp.p2.change(replacement(0, 0), replacement(-1, -1, offset, length, text))
 	tp.failIfNot(newDoc1.String() == newDoc2.String(), "documents are not equal")
 }
@@ -591,7 +596,9 @@ func TestRandomEdits(tt *testing.T) {
 	docLen := len(docStr)
 	tp := myT{tt}.newTwoPeers("emacs", "vscode", docStr)
 	for edit := 0; edit < 1000; edit++ {
-		fmt.Printf("Testing edit %d\n", edit)
+		if edit%100 == 0 {
+			fmt.Printf("Testing edit %d\n", edit)
+		}
 		i := rand.Intn(docLen)
 		verbose(1, "Replacement: %d\n", i+1)
 		if i+3 < docLen && rand.Intn(100) < 50 {

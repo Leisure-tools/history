@@ -278,7 +278,7 @@ func (blk *OpBlock) addToDescendants(s *History, descendant Sha, seen doc.Set[Sh
 }
 
 // most recent ancestor for the peer, or source block if there is none
-func (blk *OpBlock) peerParent(h *History) *OpBlock {
+func (blk *OpBlock) PeerParent(h *History) *OpBlock {
 	order := h.GetBlockOrder()
 	for i := blk.order - 1; i >= 0; i-- {
 		oblk := h.GetBlock(order[i])
@@ -305,6 +305,11 @@ func (blk *OpBlock) setBlockDoc(bdoc *document) {
 	blk.blockDocHash = sha256.Sum256([]byte(bdoc.String()))
 }
 
+func (blk *OpBlock) GetDocumentHash(s *History) Sha {
+	blk.GetDocument(s)
+	return blk.blockDocHash
+}
+
 // get the frozen document for this block
 func (blk *OpBlock) GetDocument(s *History) *document {
 	if blk.blockDoc == nil && blk.isSource() {
@@ -317,47 +322,69 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 		if d != "" {
 			blk.setBlockDoc(doc.NewDocument(d))
 		} else {
-			blk.setBlockDoc(blk.getDocumentForAncestor(s, s.lca(blk.Parents)).Freeze())
+			blk.setBlockDoc(blk.getDocumentForAncestor(s, s.lca(blk.Parents), false).Freeze())
 			s.Storage.StoreDocument(blk.blockDoc.String())
 		}
 	}
 	return blk.blockDoc.Copy()
 }
 
-func (blk *OpBlock) getDocumentForAncestor(s *History, ancestor *OpBlock) *document {
-	s.GetBlockOrder()
+func (blk *OpBlock) getDocumentForAncestor(h *History, ancestor *OpBlock, sel bool) *document {
+	h.GetBlockOrder()
 	if ancestor.Hash == blk.Hash {
-		return blk.GetDocument(s)
+		return blk.GetDocument(h)
 	} else if blk.document == nil || blk.documentAncestor != ancestor.Hash {
-		doc := s.GetDocumentForBlocks(ancestor, blk.Parents)
-		blk.applyTo(doc)
+		peerParent := blk.PeerParent(h)
+		doc := ancestor.GetDocument(h).Copy()
+		applied := blk.applyToParent(peerParent, ancestor, doc, sel)
+		for _, hash := range blk.Parents {
+			parent := h.GetBlock(hash)
+			if parent != ancestor {
+				parentDoc := parent.getDocumentForAncestor(h, ancestor, false)
+				applied = applied || blk.applyToParent(peerParent, parent, parentDoc, sel)
+				doc.Merge(parentDoc)
+			}
+		}
+		if !applied {
+			blk.applyToParent(peerParent, peerParent, doc, sel)
+		}
 		blk.documentAncestor = ancestor.Hash
 		blk.document = doc
 	}
 	return blk.document.Copy()
 }
 
+func (blk *OpBlock) applyToParent(parent, ancestor *OpBlock, doc *document, sel bool) bool {
+	if ancestor == parent {
+		doc.Apply(blk.Peer, blk.Replacements)
+		if sel && blk.SelectionOffset > -1 {
+			selection(doc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+		}
+	}
+	return ancestor == parent
+}
+
 // blocks come in any order because of pubsub
-func (blk *OpBlock) checkPending(s *History) {
-	if s.hasPendingBlock(blk.Hash) {
+func (blk *OpBlock) checkPending(h *History) {
+	if h.hasPendingBlock(blk.Hash) {
 		pending := false
-		delete(s.PendingBlocks, blk.Hash)
+		delete(h.PendingBlocks, blk.Hash)
 		for _, hash := range blk.Parents {
-			if !s.hasBlock(hash) {
+			if !h.hasBlock(hash) {
 				pending = true
-				if s.PendingOn[hash] == nil {
-					s.PendingOn[hash] = doc.Set[Sha]{}
+				if h.PendingOn[hash] == nil {
+					h.PendingOn[hash] = doc.Set[Sha]{}
 				}
-				s.PendingOn[hash].Add(blk.Hash)
-				s.Storage.StorePendingOn(hash, blk)
+				h.PendingOn[hash].Add(blk.Hash)
+				h.Storage.StorePendingOn(hash, blk)
 			}
 		}
 		if !pending {
-			s.addBlock(blk)
-			for blk := range s.getPendingOn(blk.Hash) {
-				blk.checkPending(s)
+			h.addBlock(blk)
+			for blk := range h.getPendingOn(blk.Hash) {
+				blk.checkPending(h)
 			}
-			delete(s.PendingOn, blk.Hash)
+			delete(h.PendingOn, blk.Hash)
 		}
 	}
 }
@@ -379,7 +406,7 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	// + reverse(ancestor -> parent)
 	// + get ancestor -> merged
 	h.GetBlockOrder()
-	parent := blk.peerParent(h)
+	parent := blk.PeerParent(h)
 	parents := blk.Parents
 	if parent == h.Source {
 		parents = make([]Sha, 0, len(parents)+1)
@@ -392,15 +419,18 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	}
 	parentToCurrent := parent.GetDocument(h)
 	blk.applyTo(parentToCurrent)
-	ancestorToParent := parent.getDocumentForAncestor(h, ancestor)
-	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor)
+	ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
+	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
 	peerDoc := parentToCurrent.Freeze()
-	selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+	//selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	peerDoc.Apply(blk.Peer, parentToCurrent.ReverseEdits())
 	peerDoc.Apply(blk.Peer, ancestorToParent.ReverseEdits())
 	peerDoc.Apply(blk.Peer, ancestorToMerged.Edits())
+	offset, length := getSelection(ancestorToMerged, blk.Peer)
 	peerDoc.Simplify()
-	offset, length := getSelection(peerDoc, blk.Peer)
+	//selection(peerDoc, blk.Peer, offset, length) // diag
+	//fmt.Printf("FINAL-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	return peerDoc.Edits(), offset, length
 }
 
@@ -465,7 +495,7 @@ func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *documen
 	for _, hash := range hashes {
 		parent := s.GetBlock(hash)
 		if parent != ancestor {
-			parentDoc := parent.getDocumentForAncestor(s, ancestor)
+			parentDoc := parent.getDocumentForAncestor(s, ancestor, false)
 			doc.Merge(parentDoc)
 		}
 	}
@@ -664,7 +694,7 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 		//fmt.Println("Already has block", blk.Hash)
 		return nil
 	}
-	prev := blk.peerParent(s)
+	prev := blk.PeerParent(s)
 	if prev.isSource() && s.Latest[blk.Peer] != nil || !prev.isSource() && prev.peerChild(s) != nil {
 		return ErrDivergentBlock
 	}
@@ -747,20 +777,8 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 
 // set the Selection for peer
 func selection(d *document, peer string, start int, length int) {
-	// remove old selection for peer if there is one
-	tree := doc.RemoveMarker(d.Ops, selectionStart(peer))
-	tree = doc.RemoveMarker(d.Ops, selectionEnd(peer))
-	left, right := tree.Split(func(m doc.Measure) bool {
-		return m.NewLen > start
-	})
-	mid, end := right.Split(func(m doc.Measure) bool {
-		return m.NewLen > length
-	})
-	d.Ops = left.
-		AddLast(doc.NewMarkerOp(selectionStart(peer))).
-		Concat(mid).
-		AddLast(doc.NewMarkerOp(selectionEnd(peer))).
-		Concat(end)
+	d.Mark(peer, selectionStart(peer), start)
+	d.Mark(peer, selectionEnd(peer), start+length)
 }
 
 func selectionStart(peer string) string {
@@ -774,11 +792,11 @@ func selectionEnd(peer string) string {
 func getSelection(d *document, peer string) (int, int) {
 	left, right := d.SplitOnMarker(selectionStart(peer))
 	if !right.IsEmpty() {
-		if doc.Isa[*doc.MarkerOp](right.PeekFirst()) {
-			mid, end := d.SplitOnMarker(selectionEnd(peer))
-			if doc.Isa[*doc.MarkerOp](end.PeekFirst()) {
-				return left.Measure().NewLen, mid.Measure().NewLen
-			}
+		selOff := left.Measure().NewLen + right.PeekFirst().Measure().NewLen
+		mid, rest := doc.SplitOnMarker(right.RemoveLast(), selectionEnd(peer))
+		if !rest.IsEmpty() {
+			selLen := mid.Measure().NewLen + rest.PeekFirst().Measure().NewLen
+			return selOff, selLen
 		}
 	}
 	return -1, -1
