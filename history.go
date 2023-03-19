@@ -6,6 +6,7 @@ package history
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -62,6 +63,7 @@ type Session struct {
 	*History
 	Peer       string
 	PendingOps []Replacement
+	Follow     string
 }
 
 // UUIDs
@@ -391,8 +393,11 @@ func (blk *OpBlock) checkPending(h *History) {
 
 // applyTo replacements to document
 func (blk *OpBlock) applyTo(doc *document) {
+	id := hex.EncodeToString(blk.Hash[:])
+	pos := 0
 	for _, op := range blk.Replacements {
-		doc.Replace(blk.Peer, op.Offset, op.Length, op.Text)
+		doc.Replace(id, pos, op.Offset, op.Length, op.Text)
+		pos += len(op.Text)
 	}
 }
 
@@ -451,11 +456,12 @@ func newTwosha(h1 Sha, h2 Sha) Twosha {
 /// Session
 ///
 
-func NewSession(peer string, history *History) *Session {
+func NewSession(peer string, history *History, follow string) *Session {
 	return &Session{
 		Peer:       peer,
 		PendingOps: make([]Replacement, 0, 8),
 		History:    history,
+		Follow:     follow,
 	}
 }
 
@@ -502,6 +508,8 @@ func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *documen
 	return doc
 }
 
+// deterministically compute block order
+// children are sorted by hash at each step
 func (s *History) recomputeBlockOrder() {
 	// number blocks in breadth-first order from the source by children
 	cur := make([]Sha, 0, 8)
@@ -777,8 +785,8 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 
 // set the Selection for peer
 func selection(d *document, peer string, start int, length int) {
-	d.Mark(peer, selectionStart(peer), start)
-	d.Mark(peer, selectionEnd(peer), start+length)
+	d.Mark(selectionStart(peer), start)
+	d.Mark(selectionEnd(peer), start+length)
 }
 
 func selectionStart(peer string) string {
@@ -792,10 +800,10 @@ func selectionEnd(peer string) string {
 func getSelection(d *document, peer string) (int, int) {
 	left, right := d.SplitOnMarker(selectionStart(peer))
 	if !right.IsEmpty() {
-		selOff := left.Measure().NewLen + right.PeekFirst().Measure().NewLen
+		selOff := left.Measure().Width + right.PeekFirst().Measure().Width
 		mid, rest := doc.SplitOnMarker(right.RemoveLast(), selectionEnd(peer))
 		if !rest.IsEmpty() {
-			selLen := mid.Measure().NewLen + rest.PeekFirst().Measure().NewLen
+			selLen := mid.Measure().Width + rest.PeekFirst().Measure().Width
 			return selOff, selLen
 		}
 	}

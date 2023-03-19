@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -78,9 +79,9 @@ func addInspect(h *History, blk *OpBlock, blocks map[Sha]*historyBlock) *history
 
 ///
 
-func replace(t myT, tree *document, peer string, start int, length int, text string) {
+func replace(t myT, tree *document, owner string, offset, start int, length int, text string) {
 	str := tree.String()
-	tree.Replace(peer, start, length, text)
+	tree.Replace(owner, offset, start, length, text)
 	expect := fmt.Sprintf("%s%s%s", str[0:start], text, str[start+length:])
 	if tree.String() != expect {
 		fmt.Printf("Bad tree '%s', expected '%s'\n", tree.String(), expect)
@@ -141,15 +142,15 @@ func index(str string, line, col int) int {
 
 func docONE(t myT, peer string) *document {
 	d := doc.NewDocument(docString1)
-	replace(t, d, peer, index(docString1, 0, 5), 3, "ONE")
-	replace(t, d, peer, index(docString1, 2, 10), 0, "\nline four")
+	replace(t, d, peer, 0, index(docString1, 0, 5), 3, "ONE")
+	replace(t, d, peer, 3, index(docString1, 2, 10), 0, "\nline four")
 	return d
 }
 
 func docTWO(t myT, peer string) *document {
 	d := doc.NewDocument(docString1)
-	replace(t, d, peer, index(docString1, 1, 5), 3, "TWO")
-	replace(t, d, peer, index(docString1, 2, 10), 0, "\nline five")
+	replace(t, d, peer, 0, index(docString1, 1, 5), 3, "TWO")
+	replace(t, d, peer, 3, index(docString1, 2, 10), 0, "\nline five")
 	return d
 }
 
@@ -157,7 +158,34 @@ func docs(t myT) (*document, *document) {
 	return docONE(t, "peer1"), docTWO(t, "peer2")
 }
 
+func changes(d *document) {
+	fmt.Println(d.Changes(""))
+}
+
+func ops(d *document) {
+	fmt.Println(d.OpString(true))
+}
+
+func toSlice(d *document) []doc.Operation {
+	return d.Ops.ToSlice()
+}
+
+func values(v ...any) []any {
+	result := make([]any, 0, len(v))
+	for _, obj := range v {
+		result = append(result, reflect.ValueOf(obj))
+	}
+	return result
+}
+
+func Init() {
+	fmt.Println("HELLO")
+	fmt.Printf("%v %v %v", values(changes, ops, toSlice)...)
+}
+
 func TestMerge(tt *testing.T) {
+	// uncomment this to allow changes, ops, etc. in debugging
+	//Init()
 	t := myT{tt}
 	Inspect(nil, nil)
 	a, b := docs(t)
@@ -168,8 +196,10 @@ func TestMerge(tt *testing.T) {
 	bDoc := b.String()
 	testEqual(t, bDoc, docMerged, "unsuccessful merge")
 	revDoc := doc.NewDocument(bDoc)
+	pos := 0
 	for _, r := range b.ReverseEdits() {
-		replace(t, revDoc, "peer1", r.Offset, r.Length, r.Text)
+		replace(t, revDoc, "peer1", pos, r.Offset, r.Length, r.Text)
+		pos += len(r.Text)
 	}
 	testEqual(t, revDoc.String(), docString1, "unsuccessful reversal")
 }
@@ -256,13 +286,15 @@ func clearHistoryCache(histories ...*History) {
 
 func testSession(t myT, peer string, doc string) *Session {
 	ch := NewHistory(NewMemoryStorage(doc), docString1)
-	s := NewSession(peer, ch)
+	s := NewSession(peer, ch, "")
 	testBlockOrder(t, s, 1, 1)
 	clearHistoryCache(ch)
 	return s
 }
 
 func TestEditing(tt *testing.T) {
+	// uncomment this to make diagnostic function available during debugging
+	//Init()
 	t := myT{tt}
 	s1 := testSession(t, "peer1", docString1)
 	s2 := testSession(t, "peer2", docString1)
@@ -368,11 +400,11 @@ func (t myT) newTwoPeers(peer1, peer2, doc string) *twoPeers {
 	}
 	tp.p1 = &testPeer{
 		twoPeers: tp,
-		Session:  NewSession(peer1, h),
+		Session:  NewSession(peer1, h, ""),
 	}
 	tp.p2 = &testPeer{
 		twoPeers: tp,
-		Session:  NewSession(peer2, h),
+		Session:  NewSession(peer2, h, ""),
 	}
 	tp.addBlock(h.Source)
 	return tp
@@ -516,14 +548,16 @@ func (p *testPeer) commit(anEdit, expected *edit) int {
 			diag := doc.NewDocument(expectedDoc)
 			dmp := diff.New()
 			pos := 0
+			off := 0
 			for _, dif := range dmp.DiffMain(expectedDoc, newDoc.String(), true) {
 				switch dif.Type {
 				case diff.DiffDelete:
-					diag.Replace(p.Peer, pos, len(dif.Text), "")
+					diag.Replace(p.Peer, off, pos, len(dif.Text), "")
 				case diff.DiffEqual:
 					pos += len(dif.Text)
 				case diff.DiffInsert:
-					diag.Replace(p.Peer, pos, 0, dif.Text)
+					diag.Replace(p.Peer, off, pos, 0, dif.Text)
+					off += len(dif.Text)
 				}
 			}
 			fmt.Println("Bad replacement:\n", diag.Changes("  "))
