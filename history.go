@@ -61,7 +61,9 @@ type DocStorage interface {
 // temporary connection information, not persisted to storage
 type Session struct {
 	*History
-	Peer       string
+	Peer      string
+	SessionId string
+	//SessionId  string
 	PendingOps []Replacement
 	Follow     string
 }
@@ -79,8 +81,9 @@ func newUUID() UUID {
 // [Kowaluk & Lingas (2005)](https://people.cs.nctu.edu.tw/~tjshen/doc/fulltext.pdf)
 // All public fields except Hash are transmitted (hash can be computed)
 type OpBlock struct {
-	Peer             string
-	Hash             Sha // not transmitted; computed upon reception
+	Peer             string // for security -- this layer assumes incoming block peers have been verified
+	SessionId        string // for determining parent blocks
+	Hash             Sha    // not transmitted; computed upon reception
 	Nonce            int
 	Parents          []Sha
 	Replacements     []Replacement
@@ -118,7 +121,7 @@ type MemoryStorage struct {
 ///
 
 func NewMemoryStorage(source string) *MemoryStorage {
-	src := newOpBlock("", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: source}}, 0, 0)
+	src := newOpBlock("", "", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: source}}, 0, 0)
 	return &MemoryStorage{
 		sourceBlock:   src,
 		latest:        map[string]Sha{},
@@ -205,9 +208,10 @@ func (st *MemoryStorage) StoreDocument(doc string) {
 /// opBlock
 ///
 
-func newOpBlock(peer string, nonce int, parents []Sha, repl []Replacement, selOff, selLen int) *OpBlock {
+func newOpBlock(peer, session string, nonce int, parents []Sha, repl []Replacement, selOff, selLen int) *OpBlock {
 	blk := &OpBlock{
 		Peer:            peer,
+		SessionId:       session,
 		Nonce:           nonce,
 		Parents:         parents,
 		Replacements:    repl,
@@ -231,6 +235,7 @@ func (blk *OpBlock) Clean() *OpBlock {
 	return &OpBlock{
 		Hash:            blk.Hash,
 		Peer:            blk.Peer,
+		SessionId:       blk.SessionId,
 		Nonce:           blk.Nonce,
 		Parents:         ft.Dup(blk.Parents),
 		Replacements:    ft.Dup(blk.Replacements),
@@ -243,11 +248,15 @@ func (blk *OpBlock) isSource() bool {
 	return len(blk.Parents) == 0
 }
 
+func (blk *OpBlock) replId() string {
+	return hex.EncodeToString(blk.Hash[:])
+}
+
 func (blk *OpBlock) computeHash() {
 	var blank Sha
 	if blk.Hash == blank {
 		b := &strings.Builder{}
-		fmt.Fprintln(b, blk.Peer)
+		fmt.Fprintln(b, blk.SessionId)
 		fmt.Fprintln(b, blk.Hash)
 		fmt.Fprintln(b, blk.Nonce)
 		for _, hash := range blk.Parents {
@@ -284,7 +293,7 @@ func (blk *OpBlock) PeerParent(h *History) *OpBlock {
 	order := h.GetBlockOrder()
 	for i := blk.order - 1; i >= 0; i-- {
 		oblk := h.GetBlock(order[i])
-		if oblk.Peer == blk.Peer {
+		if oblk.SessionId == blk.SessionId {
 			return oblk
 		}
 	}
@@ -295,7 +304,7 @@ func (blk *OpBlock) PeerParent(h *History) *OpBlock {
 func (blk *OpBlock) peerChild(s *History) *OpBlock {
 	for _, hash := range blk.children {
 		child := s.GetBlock(hash)
-		if child.Peer == blk.Peer {
+		if child.SessionId == blk.SessionId {
 			return child
 		}
 	}
@@ -358,9 +367,9 @@ func (blk *OpBlock) getDocumentForAncestor(h *History, ancestor *OpBlock, sel bo
 
 func (blk *OpBlock) applyToParent(parent, ancestor *OpBlock, doc *document, sel bool) bool {
 	if ancestor == parent {
-		doc.Apply(blk.Peer, blk.Replacements)
+		doc.Apply(blk.replId(), 0, blk.Replacements)
 		if sel && blk.SelectionOffset > -1 {
-			selection(doc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+			selection(doc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
 		}
 	}
 	return ancestor == parent
@@ -427,16 +436,32 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
 	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
 	peerDoc := parentToCurrent.Freeze()
-	//selection(peerDoc, blk.Peer, blk.SelectionOffset, blk.SelectionLength)
+	selection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
 	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
-	peerDoc.Apply(blk.Peer, parentToCurrent.ReverseEdits())
-	peerDoc.Apply(blk.Peer, ancestorToParent.ReverseEdits())
-	peerDoc.Apply(blk.Peer, ancestorToMerged.Edits())
-	offset, length := getSelection(ancestorToMerged, blk.Peer)
+	e := editor{peerDoc, blk.replId(), 0}
+	e.Apply(parentToCurrent.ReverseEdits())
+	e.Apply(ancestorToParent.ReverseEdits())
+	e.Apply(ancestorToMerged.Edits())
+	//peerDoc.Merge(parentToCurrent.Reversed(parent.SessionId, blk.SessionId))
+	//peerDoc.Merge(ancestorToParent.Reversed(ancestor.SessionId, parent.SessionId))
+	//peerDoc.Merge(ancestorToMerged)
+	offset, length := getSelection(ancestorToMerged, blk.SessionId)
 	peerDoc.Simplify()
-	//selection(peerDoc, blk.Peer, offset, length) // diag
+	//selection(peerDoc, blk.SessionId, offset, length) // diag
 	//fmt.Printf("FINAL-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	return peerDoc.Edits(), offset, length
+}
+
+type editor struct {
+	doc    *doc.Document
+	id     string
+	offset int
+}
+
+func (e *editor) Apply(repl []Replacement) *editor {
+	e.doc.Apply(e.id, e.offset, repl)
+	e.offset += doc.Width(repl)
+	return e
 }
 
 ///
@@ -456,9 +481,10 @@ func newTwosha(h1 Sha, h2 Sha) Twosha {
 /// Session
 ///
 
-func NewSession(peer string, history *History, follow string) *Session {
+func NewSession(peer, sessionId string, history *History, follow string) *Session {
 	return &Session{
 		Peer:       peer,
+		SessionId:  sessionId,
 		PendingOps: make([]Replacement, 0, 8),
 		History:    history,
 		Follow:     follow,
@@ -470,7 +496,7 @@ func NewSession(peer string, history *History, follow string) *Session {
 ///
 
 func NewHistory(storage DocStorage, text string) *History {
-	src := newOpBlock("", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
+	src := newOpBlock("", "", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
 	src.order = 0
 	s := &History{
 		Source:        src,
@@ -674,8 +700,8 @@ func (s *History) addBlock(blk *OpBlock) {
 		s.Storage.AddChild(parent, blk.Hash)
 		parent.addToDescendants(s, blk.Hash, seen)
 	}
-	s.Latest[blk.Peer] = blk
-	s.Storage.SetLatest(blk.Peer, blk)
+	s.Latest[blk.SessionId] = blk
+	s.Storage.SetLatest(blk.SessionId, blk)
 	count := s.Storage.GetBlockCount()
 	for _, hash := range blk.Parents {
 		if s.GetBlock(hash).order == count-1 {
@@ -703,7 +729,7 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 		return nil
 	}
 	prev := blk.PeerParent(s)
-	if prev.isSource() && s.Latest[blk.Peer] != nil || !prev.isSource() && prev.peerChild(s) != nil {
+	if prev.isSource() && s.Latest[blk.SessionId] != nil || !prev.isSource() && prev.peerChild(s) != nil {
 		return ErrDivergentBlock
 	}
 	s.PendingBlocks[blk.Hash] = blk
@@ -724,27 +750,27 @@ func SameHashes(a, b []Sha) bool {
 	return true
 }
 
-func (s *Session) latestNonTrivialHashes() []Sha {
-	latestHashes := s.LatestHashes()
-	parentSet := doc.NewSet(latestHashes...)
-	// for non-peer blocks, replace each null block with its first non-null ancestor
-	for _, b := range latestHashes {
-		blk := s.GetBlock(b)
-		if blk.Peer != s.Peer {
-			for len(blk.Replacements) == 0 && len(blk.Parents) == 1 {
-				parentSet.Remove(blk.Hash)
-				blk = s.GetBlock(blk.Parents[0])
-				parentSet.Add(blk.Hash)
-			}
-		}
-	}
-	return parentSet.ToSlice()
-}
+//func (s *Session) latestNonTrivialHashes() []Sha {
+//	latestHashes := s.LatestHashes()
+//	parentSet := doc.NewSet(latestHashes...)
+//	// for non-peer blocks, replace each null block with its first non-null ancestor
+//	for _, b := range latestHashes {
+//		blk := s.GetBlock(b)
+//		if blk.SessionId != s.SessionId {
+//			for len(blk.Replacements) == 0 && len(blk.Parents) == 1 {
+//				parentSet.Remove(blk.Hash)
+//				blk = s.GetBlock(blk.Parents[0])
+//				parentSet.Add(blk.Hash)
+//			}
+//		}
+//	}
+//	return parentSet.ToSlice()
+//}
 
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
-	parent := s.Latest[s.Peer]
+	parent := s.Latest[s.SessionId]
 	latestHashes := s.LatestHashes()
 	if parent != nil && len(s.PendingOps) == 0 {
 		if SameHashes(latestHashes, parent.Parents) {
@@ -778,7 +804,7 @@ func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
 	sortHashes(parents)
 	repl := ft.Dup(s.PendingOps)
 	s.PendingOps = s.PendingOps[:0]
-	blk := newOpBlock(s.Peer, s.Storage.GetBlockCount(), parents, repl, selOff, selLen)
+	blk := newOpBlock(s.Peer, s.SessionId, s.Storage.GetBlockCount(), parents, repl, selOff, selLen)
 	s.addBlock(blk)
 	return blk.edits(s.History)
 }
