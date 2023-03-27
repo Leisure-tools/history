@@ -327,12 +327,8 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 	if blk.blockDoc == nil && blk.isSource() {
 		blk.setBlockDoc(doc.NewDocument(blk.Replacements[0].Text))
 	} else if blk.blockDoc == nil {
-		d := ""
 		if blk.blockDocHash != EMPTY_SHA {
-			d = s.Storage.GetDocument(blk.blockDocHash)
-		}
-		if d != "" {
-			blk.setBlockDoc(doc.NewDocument(d))
+			blk.setBlockDoc(doc.NewDocument(s.Storage.GetDocument(blk.blockDocHash)))
 		} else {
 			blk.setBlockDoc(blk.getDocumentForAncestor(s, s.lca(blk.Parents), false).Freeze())
 			s.Storage.StoreDocument(blk.blockDoc.String())
@@ -444,10 +440,9 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	e.Apply(ancestorToParent.ReverseEdits())
 	e.Apply(ancestorToMerged.Edits())
 	////call parentToCurrent.Reversed(parent.SessionId, blk.SessionId).OpString(false)
-	//peerDoc.Merge(parentToCurrent.Reversed(parent.SessionId, blk.SessionId))
+	//peerDoc.Merge(parentToCurrent.Reversed(parent.replId(), blk.replId()))
 	////call ancestorToParent.Reversed(ancestor.SessionId, parent.SessionId).OpString(false)
-	////peerDoc.Merge(ancestorToParent.Reversed(ancestor.SessionId, parent.SessionId))
-	//peerDoc.Merge(ancestorToParent.Reversed(ancestor.SessionId, blk.SessionId))
+	//peerDoc.Merge(ancestorToParent.Reversed(ancestor.replId(), blk.replId()))
 	//peerDoc.Merge(ancestorToMerged)
 	offset, length := getSelection(ancestorToMerged, blk.SessionId)
 	peerDoc.Simplify()

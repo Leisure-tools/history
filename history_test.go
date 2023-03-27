@@ -30,6 +30,27 @@ type historyBlock struct {
 	OpBlock
 }
 
+type myT struct {
+	*testing.T
+}
+
+type twoSessions struct {
+	myT
+	history    *History
+	s1         *testSession
+	s2         *testSession
+	blockNames map[Sha]string
+}
+
+type testSession struct {
+	myT
+	*twoSessions
+	*History
+	peer      string
+	sessionId string
+	nonce     int
+}
+
 func verbose(n int, format string, args ...any) {
 	if n <= verbosity {
 		fmt.Printf(format, args...)
@@ -219,11 +240,11 @@ func TestMerge(tt *testing.T) {
 	testEqual(t, revDoc.String(), docString0, "unsuccessful reversal")
 }
 
-func commitEdits(t myT, s *testPeer, doc *document, expected []Replacement, expectedDoc string) {
+func commitEdits(t myT, s *testSession, doc *document, expected []Replacement, expectedDoc string) {
 	commitReplacements(t, s, doc.Edits(), expected, expectedDoc)
 }
 
-func commitReplacements(t myT, p *testPeer, edits []Replacement, expected []Replacement, expectedDoc string) {
+func commitReplacements(t myT, p *testSession, edits []Replacement, expected []Replacement, expectedDoc string) {
 	p.Commit(edits, 0, 0)
 	//repl, _, _ := s.Commit(0, 0)
 	//testEqualRepls(t, repl, expected, "replacements did not match after commit")
@@ -237,7 +258,7 @@ func commitReplacements(t myT, p *testPeer, edits []Replacement, expected []Repl
 	testEqual(t, anc.String(), expectedDoc, "committed doc did not match")
 }
 
-func addBlock(t myT, s *testPeer, blk *OpBlock, expected string) {
+func addBlock(t myT, s *testSession, blk *OpBlock, expected string) {
 	l := s.History.Storage.GetBlockCount()
 	failIfErrNow(t, s.History.addIncomingBlock(blk))
 	testBlockOrder(t, s, l+1, 1)
@@ -252,20 +273,20 @@ func addBlock(t myT, s *testPeer, blk *OpBlock, expected string) {
 	testEqual(t, anc.OriginalString(), ancestorDoc.String(), "ancestor doc did not match")
 }
 
-func (p *testPeer) Commit(repls []Replacement, selOff, selLen int) ([]Replacement, int, int) {
-	return p.History.Commit(p.peer, p.sessionId, repls, selOff, selLen)
+func (s *testSession) Commit(repls []Replacement, selOff, selLen int) ([]Replacement, int, int) {
+	return s.History.Commit(s.peer, s.sessionId, repls, selOff, selLen)
 }
 
-func testCommit(t myT, p *testPeer, startDoc, expected string) {
-	repl, _, _ := p.Commit(nil, 0, 0)
+func testCommit(t myT, s *testSession, startDoc, expected string) {
+	repl, _, _ := s.Commit(nil, 0, 0)
 	str := doc.NewDocument(startDoc)
-	str.Apply(p.sessionId, 0, repl)
+	str.Apply(s.sessionId, 0, repl)
 	testEqual(t, str.String(), expected, "Result did not match expected")
 }
 
 // strip out local data
-func outgoing(p *testPeer) *OpBlock {
-	blk := p.History.Latest[p.sessionId]
+func outgoing(s *testSession) *OpBlock {
+	blk := s.History.Latest[s.sessionId]
 	return newOpBlock(
 		blk.Peer,
 		blk.SessionId,
@@ -277,7 +298,7 @@ func outgoing(p *testPeer) *OpBlock {
 	)
 }
 
-func testBlockOrder(t myT, s *testPeer, expected, additional int) {
+func testBlockOrder(t myT, s *testSession, expected, additional int) {
 	s.History.GetBlockOrder()
 	lenBlocks := s.History.Storage.GetBlockCount()
 	testEqual(t, lenBlocks, expected,
@@ -304,9 +325,9 @@ func clearHistoryCache(histories ...*History) {
 	}
 }
 
-func newTestPeer(t myT, peer, sessionId, doc string) *testPeer {
+func newTestPeer(t myT, peer, sessionId, doc string) *testSession {
 	ch := NewHistory(NewMemoryStorage(doc), docString0)
-	p := &testPeer{t, nil, ch, peer, sessionId, 0}
+	p := &testSession{t, nil, ch, peer, sessionId, 0}
 	testBlockOrder(t, p, 1, 1)
 	clearHistoryCache(ch)
 	return p
@@ -397,52 +418,31 @@ line five`},
 	testCommit(t, p2, doc2, docMerged)
 }
 
-type myT struct {
-	*testing.T
-}
-
-type twoPeers struct {
-	myT
-	history    *History
-	p1         *testPeer
-	p2         *testPeer
-	blockNames map[Sha]string
-}
-
-type testPeer struct {
-	myT
-	*twoPeers
-	*History
-	peer      string
-	sessionId string
-	nonce     int
-}
-
-func (t myT) newTwoPeers(session1, session2, doc string) *twoPeers {
+func (t myT) newTwoSessions(session1, session2, doc string) *twoSessions {
 	h := NewHistory(NewMemoryStorage(doc), doc)
 	blockNames := map[Sha]string{}
-	tp := &twoPeers{
+	tp := &twoSessions{
 		myT:        t,
 		history:    h,
 		blockNames: blockNames,
 	}
-	tp.p1 = &testPeer{
-		myT:       t,
-		twoPeers:  tp,
-		History:   h,
-		sessionId: session1,
+	tp.s1 = &testSession{
+		myT:         t,
+		twoSessions: tp,
+		History:     h,
+		sessionId:   session1,
 	}
-	tp.p2 = &testPeer{
-		myT:       t,
-		twoPeers:  tp,
-		History:   h,
-		sessionId: session2,
+	tp.s2 = &testSession{
+		myT:         t,
+		twoSessions: tp,
+		History:     h,
+		sessionId:   session2,
 	}
 	tp.addBlock(h.Source)
 	return tp
 }
 
-func (tp *twoPeers) addBlock(blk *OpBlock) {
+func (tp *twoSessions) addBlock(blk *OpBlock) {
 	if tp.blockNames[blk.Hash] != "" {
 		return
 	}
@@ -463,11 +463,11 @@ func (tp *twoPeers) addBlock(blk *OpBlock) {
 	tp.blockNames[blk.Hash] = sb.String()
 }
 
-func (tp *twoPeers) block(blk *OpBlock) string {
+func (tp *twoSessions) block(blk *OpBlock) string {
 	return tp.blockNames[blk.Hash]
 }
 
-func (tp *twoPeers) blocks(hashes ...Sha) string {
+func (tp *twoSessions) blocks(hashes ...Sha) string {
 	sb := strings.Builder{}
 	for _, hash := range hashes {
 		fmt.Fprintf(&sb, " %s", tp.block(tp.history.GetBlock(hash)))
@@ -475,7 +475,7 @@ func (tp *twoPeers) blocks(hashes ...Sha) string {
 	return sb.String()
 }
 
-func (tp *twoPeers) printBlock(blk *OpBlock) {
+func (tp *twoSessions) printBlock(blk *OpBlock) {
 	sb := &strings.Builder{}
 	fmt.Fprintf(sb, "Block: %s[%s]:", tp.block(blk), blk.SessionId)
 	for _, p := range blk.Parents {
@@ -485,7 +485,7 @@ func (tp *twoPeers) printBlock(blk *OpBlock) {
 	fmt.Println(sb.String())
 }
 
-func (tp *twoPeers) printBlockOrder() {
+func (tp *twoSessions) printBlockOrder() {
 	sb := strings.Builder{}
 	for _, hash := range tp.history.BlockOrder {
 		block := tp.history.GetBlock(hash)
@@ -494,20 +494,20 @@ func (tp *twoPeers) printBlockOrder() {
 	fmt.Printf("BLOCK-ORDER:%s\n", sb.String())
 }
 
-func (p *testPeer) latest() *OpBlock {
-	l := p.History.Latest[p.sessionId]
+func (s *testSession) latest() *OpBlock {
+	l := s.History.Latest[s.sessionId]
 	if l == nil {
-		return p.History.Source
+		return s.History.Source
 	}
 	return l
 }
 
-func (p *testPeer) latestRepls(prefix ...any) string {
-	newPrefix := append(append(make([]any, 0, len(prefix)+1), prefix...), p.latest().Replacements)
-	return p.repls(newPrefix...)
+func (s *testSession) latestRepls(prefix ...any) string {
+	newPrefix := append(append(make([]any, 0, len(prefix)+1), prefix...), s.latest().Replacements)
+	return s.repls(newPrefix...)
 }
 
-func (p *testPeer) repls(prefixes ...any) string {
+func (s *testSession) repls(prefixes ...any) string {
 	repls := prefixes[len(prefixes)-1].([]Replacement)
 	prefixes = prefixes[:len(prefixes)-1]
 	sb := strings.Builder{}
@@ -544,24 +544,24 @@ func replacement(selOffset, selLength int, repls ...any) *edit {
 	return &edit{selOffset, selLength, r}
 }
 
-func (p *testPeer) commit(anEdit, expected *edit) int {
-	verbose(1, "latest-block: [%s] %s\n", p.sessionId, p.block(p.latest()))
+func (s *testSession) commit(anEdit, expected *edit) int {
+	verbose(1, "latest-block: [%s] %s\n", s.sessionId, s.block(s.latest()))
 	// delta is the change in size based on both anEdit and the edits from the commit
 	delta := 0
 	for _, repl := range anEdit.repls {
 		delta += len(repl.Text) - repl.Length
 	}
-	prevBlock := p.latest()
-	result, _, _ := p.Commit(anEdit.repls, anEdit.selOffset, anEdit.selLength)
-	p.nonce++
-	verbose(1, "NEW-REPLACEMENTS:\n%s", p.repls(" ", p.latest().Replacements))
-	p.twoPeers.addBlock(p.latest())
-	verbose(1, "new-block: [%s] %s\nnew-parents: %s\n", p.sessionId, p.block(p.latest()), p.blocks(p.latest().Parents...))
+	prevBlock := s.latest()
+	result, _, _ := s.Commit(anEdit.repls, anEdit.selOffset, anEdit.selLength)
+	s.nonce++
+	verbose(1, "NEW-REPLACEMENTS:\n%s", s.repls(" ", s.latest().Replacements))
+	s.twoSessions.addBlock(s.latest())
+	verbose(1, "new-block: [%s] %s\nnew-parents: %s\n", s.sessionId, s.block(s.latest()), s.blocks(s.latest().Parents...))
 	if verbosity > 0 {
-		p.printBlock(p.latest())
-		p.printBlockOrder()
+		s.printBlock(s.latest())
+		s.printBlockOrder()
 	}
-	p.failIfNot(len(result) == len(expected.repls), "bad-replacement: [%s] expected %d replacements but got %d:\n%sbad-repls-latest:\n%s", p.sessionId, len(expected.repls), len(result), p.repls(" ", result), p.latestRepls(" "))
+	s.failIfNot(len(result) == len(expected.repls), "bad-replacement: [%s] expected %d replacements but got %d:\n%sbad-repls-latest:\n%s", s.sessionId, len(expected.repls), len(result), s.repls(" ", result), s.latestRepls(" "))
 	bad := -1
 	for i, repl := range result {
 		delta += len(repl.Text) - repl.Length
@@ -570,10 +570,10 @@ func (p *testPeer) commit(anEdit, expected *edit) int {
 		}
 	}
 	if bad > -1 {
-		prevDoc := prevBlock.GetDocument(p.history).String()
-		expectedDoc := p.latest().GetDocument(p.history).String()
+		prevDoc := prevBlock.GetDocument(s.history).String()
+		expectedDoc := s.latest().GetDocument(s.history).String()
 		newDoc := doc.NewDocument(prevDoc)
-		newDoc.Apply(p.sessionId, 0, result)
+		newDoc.Apply(s.sessionId, 0, result)
 		// sometimes returned replacements are not exactly as expected but the result is still correct
 		if newDoc.String() != expectedDoc {
 			fmt.Printf("Expected\n %v\n but got\n %v\n", result[bad], expected.repls[bad])
@@ -584,43 +584,43 @@ func (p *testPeer) commit(anEdit, expected *edit) int {
 			for _, dif := range dmp.DiffMain(expectedDoc, newDoc.String(), true) {
 				switch dif.Type {
 				case diff.DiffDelete:
-					diag.Replace(p.sessionId, off, pos, len(dif.Text), "")
+					diag.Replace(s.sessionId, off, pos, len(dif.Text), "")
 				case diff.DiffEqual:
 					pos += len(dif.Text)
 				case diff.DiffInsert:
-					diag.Replace(p.sessionId, off, pos, 0, dif.Text)
+					diag.Replace(s.sessionId, off, pos, 0, dif.Text)
 					off += len(dif.Text)
 				}
 			}
 			fmt.Println("Bad replacement:\n", diag.Changes("  "))
-			p.failNow("bad replacement from commit")
+			s.failNow("bad replacement from commit")
 		}
 	}
 	return delta
 }
 
-func (p *testPeer) change(newEdit, expected *edit) *document {
-	l := p.latest()
-	doc := p.latest().GetDocument(p.history)
+func (s *testSession) change(newEdit, expected *edit) *document {
+	l := s.latest()
+	doc := s.latest().GetDocument(s.history)
 	verbose(1, "EDIT: %+v\n", newEdit)
-	delta := p.commit(newEdit, expected)
+	delta := s.commit(newEdit, expected)
 	verbose(1, "Delta: %d\n", delta)
-	newDoc := p.latest().GetDocument(p.history)
+	newDoc := s.latest().GetDocument(s.history)
 	verbose(1, "DOC:\n%s\n", doc.Changes("  "))
 	verbose(1, "NEW-DOC:\n%s\n", newDoc.Changes("  "))
-	verbose(1, "OLD == NEW: %v\n", l == p.latest())
-	p.failIfNot(doc.String() != newDoc.String(), "document is unchanged")
-	p.failIfNot(len(doc.String())+delta == len(newDoc.String()), "new document for %s size is wrong, expected delta %d\n (%d) '%s' but got\n (%d) '%s'", p.sessionId, delta, len(doc.String())+delta, doc.String(), len(newDoc.String()), newDoc.String())
+	verbose(1, "OLD == NEW: %v\n", l == s.latest())
+	s.failIfNot(doc.String() != newDoc.String(), "document is unchanged")
+	s.failIfNot(len(doc.String())+delta == len(newDoc.String()), "new document for %s size is wrong, expected delta %d\n (%d) '%s' but got\n (%d) '%s'", s.sessionId, delta, len(doc.String())+delta, doc.String(), len(newDoc.String()), newDoc.String())
 	return newDoc
 }
 
-func (tp *twoPeers) change(offset, length int, text string) {
+func (tp *twoSessions) change(offset, length int, text string) {
 	verbose(1, "replace: %d %d %s\n", offset, length, text)
 	verbose(1, "=========EMACS==========\n")
-	newDoc1 := tp.p1.change(replacement(0, 0, offset, length, text), replacement(-1, -1))
+	newDoc1 := tp.s1.change(replacement(0, 0, offset, length, text), replacement(-1, -1))
 	verbose(1, "DOC:\n  '%s'\n", strings.Join(strings.Split(newDoc1.String(), "\n"), "'\n  '"))
 	verbose(1, "--------VS CODE---------\n")
-	newDoc2 := tp.p2.change(replacement(0, 0), replacement(-1, -1, offset, length, text))
+	newDoc2 := tp.s2.change(replacement(0, 0), replacement(-1, -1, offset, length, text))
 	tp.failIfNot(newDoc1.String() == newDoc2.String(), "documents are not equal")
 }
 
@@ -638,7 +638,7 @@ func TestPeerEdits(tt *testing.T) {
 		}
 		docBuf.WriteString("\n")
 	}
-	tp := myT{tt}.newTwoPeers("emacs", "vscode", docBuf.String())
+	tp := myT{tt}.newTwoSessions("emacs", "vscode", docBuf.String())
 	for i, offset := range inserts {
 		verbose(1, "Replacement: %d\n", i+1)
 		tp.change(offset, 0, "a")
@@ -660,7 +660,7 @@ func TestRandomEdits(tt *testing.T) {
 	}
 	docStr := docBuf.String()
 	docLen := len(docStr)
-	tp := myT{tt}.newTwoPeers("emacs", "vscode", docStr)
+	tp := myT{tt}.newTwoSessions("emacs", "vscode", docStr)
 	for edit := 0; edit < 1000; edit++ {
 		if edit%100 == 0 {
 			fmt.Printf("Testing edit %d\n", edit)
