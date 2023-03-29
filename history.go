@@ -400,11 +400,7 @@ func (blk *OpBlock) checkPending(h *History) {
 // applyTo replacements to document
 func (blk *OpBlock) applyTo(doc *document) {
 	id := hex.EncodeToString(blk.Hash[:])
-	pos := 0
-	for _, op := range blk.Replacements {
-		doc.Replace(id, pos, op.Offset, op.Length, op.Text)
-		pos += len(op.Text)
-	}
+	doc.Apply(id, 0, blk.Replacements)
 }
 
 // compute edits to reconstruct merged document for a block
@@ -430,14 +426,16 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	}
 	parentToCurrent := parent.GetDocument(h)
 	blk.applyTo(parentToCurrent)
-	ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
-	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
 	peerDoc := parentToCurrent.Freeze()
 	selection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
 	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	e := editor{peerDoc, blk.replId(), 0}
 	e.Apply(parentToCurrent.ReverseEdits())
-	e.Apply(ancestorToParent.ReverseEdits())
+	if ancestor.Hash != parent.Hash {
+		ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
+		e.Apply(ancestorToParent.ReverseEdits())
+	}
+	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
 	e.Apply(ancestorToMerged.Edits())
 	////call parentToCurrent.Reversed(parent.SessionId, blk.SessionId).OpString(false)
 	//peerDoc.Merge(parentToCurrent.Reversed(parent.replId(), blk.replId()))
@@ -737,14 +735,19 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 	return nil
 }
 
-func SameHashes(a, b []Sha) bool {
-	if len(a) != len(b) {
+func SameHashes(a, b []Sha, exclude Sha) bool {
+	if len(a) != len(b)+1 {
 		return false
 	}
-	for i, hashA := range a {
-		if bytes.Compare(hashA[:], b[i][:]) != 0 {
+	pos := 0
+	for _, hashA := range a {
+		if bytes.Compare(hashA[:], b[pos][:]) != 0 {
+			if bytes.Compare(hashA[:], exclude[:]) == 0 {
+				continue
+			}
 			return false
 		}
+		pos++
 	}
 	return true
 }
@@ -779,8 +782,8 @@ func SameHashes(a, b []Sha) bool {
 func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int, selLen int) ([]Replacement, int, int) {
 	parent := h.Latest[sessionId]
 	latestHashes := h.LatestHashes()
-	if parent != nil && len(repls) == 0 {
-		if SameHashes(latestHashes, parent.Parents) {
+	if len(repls) == 0 {
+		if (parent == nil && len(h.Latest) == 0) || parent != nil && SameHashes(latestHashes, parent.Parents, parent.Hash) {
 			// no changes
 			return []Replacement{}, selOff, selLen
 		}

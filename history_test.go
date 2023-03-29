@@ -18,6 +18,26 @@ var verbosity = 0
 var inspector historyInspector
 var block historyBlock
 
+const docString0 = `line one
+line two
+line three`
+
+const docString1 = `line ONE
+line two
+line three
+line four`
+
+const docString2 = `line one
+line TWO
+line three
+line five`
+
+const docMerged = `line ONE
+line TWO
+line three
+line four
+line five`
+
 type historyInspector struct {
 	*History
 	latest []historyBlock
@@ -139,26 +159,6 @@ func (t myT) failNow(msg any) {
 	debug.PrintStack()
 	t.FailNow()
 }
-
-const docString0 = `line one
-line two
-line three`
-
-const docString1 = `line ONE
-line two
-line three
-line four`
-
-const docString2 = `line one
-line TWO
-line three
-line five`
-
-const docMerged = `line ONE
-line TWO
-line three
-line four
-line five`
 
 func index(str string, line, col int) int {
 	i := 0
@@ -534,7 +534,7 @@ type edit struct {
 
 func replacement(selOffset, selLength int, repls ...any) *edit {
 	r := make([]Replacement, 0, len(repls)/3)
-	for pos := 0; pos+2 < len(repls); pos++ {
+	for pos := 0; pos+2 < len(repls); pos += 3 {
 		r = append(r, doc.Replacement{
 			Offset: doc.As[int](repls[pos]),
 			Length: doc.As[int](repls[pos+1]),
@@ -601,7 +601,7 @@ func (s *testSession) commit(anEdit, expected *edit) int {
 
 func (s *testSession) change(newEdit, expected *edit) *document {
 	l := s.latest()
-	doc := s.latest().GetDocument(s.history)
+	doc := l.GetDocument(s.history)
 	verbose(1, "EDIT: %+v\n", newEdit)
 	delta := s.commit(newEdit, expected)
 	verbose(1, "Delta: %d\n", delta)
@@ -675,4 +675,33 @@ func TestRandomEdits(tt *testing.T) {
 			docLen++
 		}
 	}
+}
+
+func (server *twoSessions) checkSimpleChange(edit, expected *edit) {
+	doc := server.history.GetLatestDocument().String()
+	server.s1.change(edit, expected)
+	for _, repl := range edit.repls {
+		doc = doc[:repl.Offset] + repl.Text + doc[repl.Offset+repl.Length:]
+	}
+	testEqual(server.myT, server.history.GetLatestDocument().String(), doc, "latest document is wrong")
+}
+
+func TestLatestDocument(tt *testing.T) {
+	verbosity = 2
+	t := myT{tt}
+	server := t.newTwoSessions("emacs", "vscode", docString0)
+	l := len(server.history.GetBlockOrder())
+	server.s1.commit(replacement(0, 0), replacement(-1, -1))
+	server.s1.commit(replacement(0, 0), replacement(-1, -1))
+	server.s1.commit(replacement(0, 0), replacement(-1, -1))
+	testEqual(t, len(server.history.GetBlockOrder()), l, "inserted redundant blocks")
+	server.checkSimpleChange(replacement(0, 0, 5, 3, "ONE"), replacement(-1, -1))
+	server.s2.change(replacement(0, 0), replacement(0, 0, 5, 3, "ONE"))
+	server.checkSimpleChange(replacement(0, 0, 28, 0, "\nline four"), replacement(-1, -1))
+	server.checkSimpleChange(replacement(0, 0, 5, 3, "TWO"), replacement(-1, -1))
+	server.s2.change(replacement(0, 0), replacement(0, 0, 28, 0, "\nline four", 5, 3, "TWO"))
+	server.checkSimpleChange(replacement(0, 0, 38, 0, "\nline five"), replacement(-1, -1))
+	server.s2.change(replacement(0, 0), replacement(0, 0, 38, 0, "\nline five"))
+	server.checkSimpleChange(replacement(0, 0, 48, 0, "\nline sixA"), replacement(-1, -1))
+	server.s2.change(replacement(0, 0), replacement(0, 0, 48, 0, "\nline sixA"))
 }
