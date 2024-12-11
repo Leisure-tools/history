@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/rand"
+
+	//"math/rand"
+	"crypto/rand"
 	"sort"
 	"strings"
 
@@ -91,7 +93,7 @@ type OpBlock struct {
 	SelectionLength  int
 	document         *document // simple cache to speed up successive document edits
 	documentAncestor Sha
-	blockDoc         *document // frozen document for this block
+	blockDoc         *document // frozen document for this block, used for computing edits
 	blockDocHash     Sha
 	children         []Sha
 	descendants      doc.Set[Sha]
@@ -323,10 +325,12 @@ func (blk *OpBlock) GetDocumentHash(s *History) Sha {
 }
 
 // get the frozen document for this block
+// history arg is for computing it if there is none
 func (blk *OpBlock) GetDocument(s *History) *document {
 	if blk.blockDoc == nil && blk.isSource() {
 		blk.setBlockDoc(doc.NewDocument(blk.Replacements[0].Text))
 	} else if blk.blockDoc == nil {
+		// no blockDoc yet, compute it
 		if blk.blockDocHash != EMPTY_SHA {
 			blk.setBlockDoc(doc.NewDocument(s.Storage.GetDocument(blk.blockDocHash)))
 		} else {
@@ -337,6 +341,7 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 	return blk.blockDoc.Copy()
 }
 
+// get the frozen document for an ancestor
 func (blk *OpBlock) getDocumentForAncestor(h *History, ancestor *OpBlock, sel bool) *document {
 	h.GetBlockOrder()
 	if ancestor.Hash == blk.Hash {
@@ -741,7 +746,9 @@ func SameHashes(a, b []Sha, exclude Sha) bool {
 	}
 	pos := 0
 	for _, hashA := range a {
-		if bytes.Compare(hashA[:], b[pos][:]) != 0 {
+		if pos >= len(b) {
+			return false
+		} else if bytes.Compare(hashA[:], b[pos][:]) != 0 {
 			if bytes.Compare(hashA[:], exclude[:]) == 0 {
 				continue
 			}
