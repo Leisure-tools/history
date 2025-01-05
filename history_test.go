@@ -130,6 +130,10 @@ func replace(t myT, doc *document, owner string, offset, start int, length int, 
 	}
 }
 
+func (t myT) testEqual(actual any, expected any, msg string) {
+	testEqual(t, actual, expected, msg)
+}
+
 func testEqual(t myT, actual any, expected any, msg string) {
 	t.failIfNot(actual == expected, fmt.Sprintf("%s: expected <%v> but got <%v>", msg, expected, actual))
 }
@@ -326,7 +330,7 @@ func clearHistoryCache(histories ...*History) {
 }
 
 func newTestPeer(t myT, peer, sessionId, doc string) *testSession {
-	ch := NewHistory(NewMemoryStorage(doc), docString0)
+	ch := NewHistory(NewMemoryStorage(doc), doc)
 	p := &testSession{t, nil, ch, peer, sessionId, 0}
 	testBlockOrder(t, p, 1, 1)
 	clearHistoryCache(ch)
@@ -704,4 +708,55 @@ func TestLatestDocument(tt *testing.T) {
 	server.s2.change(replacement(0, 0), replacement(0, 0, 38, 0, "\nline five"))
 	server.checkSimpleChange(replacement(0, 0, 48, 0, "\nline sixA"), replacement(-1, -1))
 	server.s2.change(replacement(0, 0), replacement(0, 0, 48, 0, "\nline sixA"))
+}
+
+func newOffsets(doc []string, off []int) {
+	tot := 0
+	for i, v := range doc {
+		off[i] = tot
+		tot += len(v)
+	}
+}
+
+func TestSet(tt *testing.T) {
+	doc0 := []string{`
+#+NAME: one
+#+begin_src yaml
+`, // 0
+		`a: 1`, // 1
+		`
+#+end_src
+#+NAME: two
+#+begin_src yaml
+`, // 2
+		`b: 2`, // 3
+		`
+#+end_src
+#+NAME: three
+#+begin_src yaml
+`, // 4
+		`c: 3`, //5
+		`
+#+end_src
+`} // 6
+	offsets := make([]int, len(doc0))
+	doc1 := make([]string, len(doc0))
+	//verbosity = 2
+	t := myT{tt}
+	s := newTestPeer(t, "", "session1", strings.Join(doc0, ""))
+	testReplace := func(pos int, newText string) {
+		newOffsets(doc0, offsets)
+		copy(doc1, doc0)
+		s.Commit([]Replacement{doc.Replacement{
+			Offset: offsets[pos],
+			Length: len(doc0[pos]),
+			Text:   newText,
+		}}, -1, -1)
+		doc0[pos] = newText
+		latest := s.GetLatestDocument().String()
+		t.testEqual(latest, strings.Join(doc0, ""), "Replacement mismatch")
+	}
+	testReplace(5, `6`)
+	testReplace(3, `5`)
+	testReplace(1, `4`)
 }

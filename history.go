@@ -32,14 +32,15 @@ var EMPTY_SHA Sha
 
 // History of a document
 type History struct {
-	Source        *OpBlock
-	Latest        map[string]*OpBlock // peer -> block
-	Blocks        map[Sha]*OpBlock
-	PendingOn     map[Sha]doc.Set[Sha]
-	PendingBlocks map[Sha]*OpBlock
-	Storage       DocStorage
-	LCAs          map[Twosha]*LCA // 2-block LCAs
+	Source        *OpBlock             // the first block
+	Latest        map[string]*OpBlock  // peer -> block
+	Blocks        map[Sha]*OpBlock     // all blocks
+	PendingBlocks map[Sha]*OpBlock     // pending blocks whose parent has not been received
+	PendingOn     map[Sha]doc.Set[Sha] // unreceived parents for pending blocks
+	Storage       DocStorage           // storage (optionally external)
+	LCAs          map[Twosha]*LCA      // cache of 2-block latest common ancestors
 	BlockOrder    []Sha
+	//	Heads         map[Sha]*OpBlock     // current unmerged heads -- edits should merge these
 }
 
 type DocStorage interface {
@@ -512,6 +513,14 @@ func NewHistory(storage DocStorage, text string) *History {
 	s.LCAs = map[Twosha]*LCA{}
 	storage.StoreBlock(src)
 	return s
+}
+
+func (s *History) LatestBlock(sessionId string) *OpBlock {
+	blk := s.Latest[sessionId]
+	if blk == nil {
+		blk = s.Source
+	}
+	return blk
 }
 
 func (s *History) GetDocument(hash Sha) string {
