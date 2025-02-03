@@ -278,7 +278,58 @@ func addBlock(t myT, s *testSession, blk *OpBlock, expected string) {
 }
 
 func (s *testSession) Commit(repls []Replacement, selOff, selLen int) ([]Replacement, int, int) {
-	return s.History.Commit(s.peer, s.sessionId, repls, selOff, selLen)
+	repl, selOff, selLen := s.History.Commit(s.peer, s.sessionId, repls, selOff, selLen)
+	s.verifyEdits()
+	return repl, selOff, selLen
+}
+
+func (s *testSession) verifyEdits() {
+	//}
+	//func (s *testSession) real_verifyEdits() {
+	blk := s.History.Latest[s.sessionId]
+	if blk == nil || len(blk.Parents) == 0 {
+		return
+	}
+	anc := s.History.lca(blk.Parents)
+	firstParent := s.History.GetBlock(blk.Parents[0])
+	result := firstParent.getDocumentForAncestor(s.History, anc, false)
+	for _, parentHash := range blk.Parents[1:] {
+		parent := s.History.GetBlock(parentHash)
+		result.Merge(parent.getDocumentForAncestor(s.History, anc, false))
+	}
+	prev := result.Copy()
+	result.Apply("", 0, blk.Replacements)
+	expected := blk.GetRawDocument(s.History).String()
+	eq := result.String() == expected
+	if !eq {
+		println()
+		fmt.Println("REPL ID: ", blk.replId())
+		fmt.Println("PARENT ID: ", blk.SessionParent(s.History).replId())
+		fmt.Println("OLD REPLS: ", blk.Replacements)
+		fmt.Println("NEW REPLS: ", blk.Replacements)
+		fmt.Println("EXPECTED TREE:\n", doc.Changes("  ", blk.GetRawDocument(s.History).GetOps()))
+		fmt.Println("ACTUAL TREE BEFORE REPL:\n", doc.Changes("  ", prev.GetOps()))
+		fmt.Println("ACTUAL TREE:\n", doc.Changes("  ", result.GetOps()))
+		fmt.Println("EXPECTED:\n", expected, "\nGOT:\n", result)
+		os.Exit(1)
+	} else if !sameRepls(blk.Replacements, blk.Replacements) {
+		fmt.Println("OLD REPLS: ", blk.Replacements)
+		fmt.Println("NEW REPLS: ", blk.Replacements)
+	}
+	s.testEqual(eq, true, "BAD NEW REPLACEMENTS")
+}
+
+func sameRepls(a, b []doc.Replacement) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, ra := range a {
+		rb := b[i]
+		if ra.Offset != rb.Offset || ra.Length != rb.Length || ra.Text != rb.Text {
+			return false
+		}
+	}
+	return true
 }
 
 func testCommit(t myT, s *testSession, startDoc, expected string) {
@@ -759,4 +810,32 @@ func TestSet(tt *testing.T) {
 	testReplace(5, `6`)
 	testReplace(3, `5`)
 	testReplace(1, `4`)
+}
+
+func TestComplexEditing(tt *testing.T) {
+	t := myT{tt}
+	p1 := newTestPeer(t, "", "session1", docString0)
+	p2 := newTestPeer(t, "", "session2", docString0)
+	p3 := newTestPeer(t, "", "session3", docString0)
+	p2.Commit([]Replacement{Replacement{0, 0, "line ZERO\n"}}, -1, -1)
+	p3.Commit([]Replacement{Replacement{23, 5, "THREE"}}, -1, -1)
+	blk2 := outgoing(p2)
+	doc2 := p2.GetLatestDocument().String()
+	t.testEqual(doc2, `line ZERO
+line one
+line two
+line three`, "Doc 2 is bad")
+	blk3 := outgoing(p3)
+	doc3 := p3.GetLatestDocument().String()
+	t.testEqual(doc3, `line one
+line two
+line THREE`, "Doc 3 is bad")
+	addBlock(t, p1, blk2, doc2)
+	addBlock(t, p1, blk3, doc3)
+	p1.Commit([]Replacement{Replacement{5, 3, "ONE"}}, -1, -1)
+	doc1 := p1.GetLatestDocument().String()
+	t.testEqual(doc1, `line ZERO
+line ONE
+line two
+line THREE`, "Doc 1 is bad")
 }

@@ -34,13 +34,13 @@ var EMPTY_SHA Sha
 type History struct {
 	Source        *OpBlock             // the first block
 	Latest        map[string]*OpBlock  // peer -> block
-	Blocks        map[Sha]*OpBlock     // all blocks
+	Blocks        map[Sha]*OpBlock     // blocks by Sha -- Storage is a fallback for missing ones
 	PendingBlocks map[Sha]*OpBlock     // pending blocks whose parent has not been received
 	PendingOn     map[Sha]doc.Set[Sha] // unreceived parents for pending blocks
 	Storage       DocStorage           // storage (optionally external)
 	LCAs          map[Twosha]*LCA      // cache of 2-block latest common ancestors
 	BlockOrder    []Sha
-	//	Heads         map[Sha]*OpBlock     // current unmerged heads -- edits should merge these
+	//	Heads         []*OpBlock // current DAG heads -- edits should merge these
 }
 
 type DocStorage interface {
@@ -89,7 +89,7 @@ type OpBlock struct {
 	Hash             Sha    // not transmitted; computed upon reception
 	Nonce            int
 	Parents          []Sha
-	Replacements     []Replacement
+	Replacements     []Replacement // replacements applied to the parents
 	SelectionOffset  int
 	SelectionLength  int
 	document         *document // simple cache to speed up successive document edits
@@ -226,6 +226,13 @@ func newOpBlock(peer, session string, nonce int, parents []Sha, repl []Replaceme
 	return blk
 }
 
+func (blk *OpBlock) getDocumentAncestor(h *History) *OpBlock {
+	if blk.documentAncestor != EMPTY_SHA {
+		return h.GetBlock(blk.documentAncestor)
+	}
+	return h.lca(blk.Parents)
+}
+
 func (blk *OpBlock) GetDescendants() doc.Set[Sha] {
 	return blk.descendants
 }
@@ -292,7 +299,7 @@ func (blk *OpBlock) addToDescendants(s *History, descendant Sha, seen doc.Set[Sh
 	}
 }
 
-// most recent ancestor for the peer, or source block if there is none
+// most recent ancestor for the session, or source block if there is none
 func (blk *OpBlock) SessionParent(h *History) *OpBlock {
 	order := h.GetBlockOrder()
 	for i := blk.order - 1; i >= 0; i-- {
@@ -335,14 +342,23 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 		if blk.blockDocHash != EMPTY_SHA {
 			blk.setBlockDoc(doc.NewDocument(s.Storage.GetDocument(blk.blockDocHash)))
 		} else {
-			blk.setBlockDoc(blk.getDocumentForAncestor(s, s.lca(blk.Parents), false).Freeze())
+			doc := s.GetDocumentForBlocks(blk.getDocumentAncestor(s), blk.Parents)
+			doc.Apply("", 0, blk.Replacements)
+			blk.setBlockDoc(doc.Freeze())
 			s.Storage.StoreDocument(blk.blockDoc.String())
 		}
 	}
 	return blk.blockDoc.Copy()
 }
 
-// get the frozen document for an ancestor
+func (blk *OpBlock) GetRawDocument(s *History) *document {
+	if blk.blockDocHash != EMPTY_SHA {
+		return doc.NewDocument(s.Storage.GetDocument(blk.blockDocHash))
+	}
+	return blk.getDocumentForAncestor(s, blk.getDocumentAncestor(s), false)
+}
+
+// get the document for an ancestor
 func (blk *OpBlock) getDocumentForAncestor(h *History, ancestor *OpBlock, sel bool) *document {
 	h.GetBlockOrder()
 	if ancestor.Hash == blk.Hash {
@@ -372,7 +388,7 @@ func (blk *OpBlock) applyToParent(parent, ancestor *OpBlock, doc *document, sel 
 	if ancestor == parent {
 		doc.Apply(blk.replId(), 0, blk.Replacements)
 		if sel && blk.SelectionOffset > -1 {
-			selection(doc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
+			markSelection(doc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
 		}
 	}
 	return ancestor == parent
@@ -426,14 +442,21 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 		parents = append(make([]Sha, 0, len(parents)+1), blk.Parents...)
 		parents = append(parents, h.Source.Hash)
 	}
-	ancestor := h.lca(parents)
+	ancestor := blk.getDocumentAncestor(h)
 	if parent.order < ancestor.order {
 		ancestor = parent
 	}
 	parentToCurrent := parent.GetDocument(h)
 	blk.applyTo(parentToCurrent)
 	peerDoc := parentToCurrent.Freeze()
-	selection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
+	if blk.SelectionOffset != -1 {
+		markSelection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
+		so, sl := getSelection(peerDoc, blk.SessionId)
+		if so != blk.SelectionOffset || sl != blk.SelectionLength {
+			println("DOCUMENT\n", peerDoc.Changes("  "))
+			panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", blk.SelectionOffset, blk.SelectionLength, so, sl))
+		}
+	}
 	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	e := editor{peerDoc, blk.replId(), 0}
 	e.Apply(parentToCurrent.ReverseEdits())
@@ -443,15 +466,8 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	}
 	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
 	e.Apply(ancestorToMerged.Edits())
-	////call parentToCurrent.Reversed(parent.SessionId, blk.SessionId).OpString(false)
-	//peerDoc.Merge(parentToCurrent.Reversed(parent.replId(), blk.replId()))
-	////call ancestorToParent.Reversed(ancestor.SessionId, parent.SessionId).OpString(false)
-	//peerDoc.Merge(ancestorToParent.Reversed(ancestor.replId(), blk.replId()))
-	//peerDoc.Merge(ancestorToMerged)
-	offset, length := getSelection(ancestorToMerged, blk.SessionId)
+	offset, length := getSelection(peerDoc, blk.SessionId)
 	peerDoc.Simplify()
-	//selection(peerDoc, blk.SessionId, offset, length) // diag
-	//fmt.Printf("FINAL-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
 	return peerDoc.Edits(), offset, length
 }
 
@@ -479,20 +495,6 @@ func newTwosha(h1 Sha, h2 Sha) Twosha {
 	copy(result[len(hashes[0]):], hashes[1][:])
 	return result
 }
-
-/////
-///// Session
-/////
-//
-//func NewSession(peer, sessionId string, history *History, follow string) *Session {
-//	return &Session{
-//		Peer:       peer,
-//		SessionId:  sessionId,
-//		PendingOps: make([]Replacement, 0, 8),
-//		History:    history,
-//		Follow:     follow,
-//	}
-//}
 
 ///
 /// History
@@ -686,18 +688,6 @@ func (s *History) LatestHashes() []Sha {
 	return hashes
 }
 
-//// add a replacement to pendingOps
-//func (s *Session) Replace(offset int, length int, text string) {
-//	s.PendingOps = append(s.PendingOps, Replacement{Offset: offset, Length: length, Text: text})
-//}
-
-//// add a replacement to pendingOps
-//func (s *Session) ReplaceAll(replacements []Replacement) {
-//	for _, repl := range replacements {
-//		s.Replace(repl.Offset, repl.Length, repl.Text)
-//	}
-//}
-
 func (s *History) addBlock(blk *OpBlock) {
 	if len(blk.Parents) == 0 {
 		panic("Adding block with not parents")
@@ -768,31 +758,6 @@ func SameHashes(a, b []Sha, exclude Sha) bool {
 	return true
 }
 
-//func (s *Session) latestNonTrivialHashes() []Sha {
-//	latestHashes := s.LatestHashes()
-//	parentSet := doc.NewSet(latestHashes...)
-//	// for non-peer blocks, replace each null block with its first non-null ancestor
-//	for _, b := range latestHashes {
-//		blk := s.GetBlock(b)
-//		if blk.SessionId != s.SessionId {
-//			for len(blk.Replacements) == 0 && len(blk.Parents) == 1 {
-//				parentSet.Remove(blk.Hash)
-//				blk = s.GetBlock(blk.Parents[0])
-//				parentSet.Add(blk.Hash)
-//			}
-//		}
-//	}
-//	return parentSet.ToSlice()
-//}
-
-//// commit pending ops into an opBlock, get its document, and return the replacements
-//// these will unwind the current document to the common ancestor and replay to the current version
-//func (s *Session) Commit(selOff int, selLen int) ([]Replacement, int, int) {
-//	repls := ft.Dup(s.PendingOps)
-//	s.PendingOps = s.PendingOps[:0]
-//	return s.History.Commit(s.Peer, s.SessionId, repls, selOff, selLen)
-//}
-
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int, selLen int) ([]Replacement, int, int) {
@@ -804,7 +769,6 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 			return []Replacement{}, selOff, selLen
 		}
 	}
-	//latestHashes = s.latestNonTrivialHashes()
 	excluded := doc.Set[Sha]{}
 	for i, p := range latestHashes {
 		if !excluded.Has(p) {
@@ -829,14 +793,35 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 	}
 	sortHashes(parents)
 	blk := newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repls, selOff, selLen)
+	start := selectionStart(blk.SessionId)
+	end := selectionEnd(blk.SessionId)
+	markArgs := ([]string{start, end})[:]
+	if selOff == -1 {
+		markArgs = markArgs[:0]
+	}
+	repls, markers := blk.GetRawDocument(h).EditsFor(blk.replId(), markArgs...)
+	blk.Replacements = repls
+	if selOff != -1 {
+		blk.SelectionOffset = markers[start]
+		blk.SelectionLength = markers[end] - markers[start]
+	} else {
+		blk.SelectionOffset = -1
+		blk.SelectionLength = -1
+	}
 	h.addBlock(blk)
-	return blk.edits(h)
+	r, rSelOff, rSelLen := blk.edits(h)
+	if blk.SelectionOffset != rSelOff || blk.SelectionLength != rSelLen {
+		panic(fmt.Sprintf("Error in new block selections:\n  given sel: %-5d len: %-5d\n  result sel: %-5d len: %-5d\n  new sel: %-5d, len: %-5d", selOff, selLen, rSelOff, rSelLen, blk.SelectionOffset, blk.SelectionLength))
+	}
+	return r, selOff, selLen
 }
 
 // set the Selection for peer
-func selection(d *document, session string, start int, length int) {
-	d.Mark(selectionStart(session), start)
-	d.Mark(selectionEnd(session), start+length)
+func markSelection(d *document, session string, start int, length int) {
+	if start != -1 {
+		d.Mark(selectionStart(session), start)
+		d.Mark(selectionEnd(session), start+length)
+	}
 }
 
 func selectionStart(session string) string {
@@ -847,13 +832,17 @@ func selectionEnd(peer string) string {
 	return fmt.Sprint(peer, ".sel.end")
 }
 
-func getSelection(d *document, peer string) (int, int) {
-	left, right := d.SplitOnMarker(selectionStart(peer))
+func getSelection(d *document, session string) (int, int) {
+	left, right := d.SplitOnMarker(selectionStart(session))
 	if !right.IsEmpty() {
-		selOff := left.Measure().Width + right.PeekFirst().Measure().Width
-		mid, rest := doc.SplitOnMarker(right.RemoveLast(), selectionEnd(peer))
+		endMarker := selectionEnd(session)
+		selOff := left.Measure().Width
+		if right.PeekFirst().(*doc.MarkerOp).Names.Has(endMarker) {
+			return selOff, 0
+		}
+		mid, rest := doc.SplitOnMarker(right.RemoveFirst(), endMarker)
 		if !rest.IsEmpty() {
-			selLen := mid.Measure().Width + rest.PeekFirst().Measure().Width
+			selLen := mid.Measure().Width
 			return selOff, selLen
 		}
 	}
