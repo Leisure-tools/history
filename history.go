@@ -124,7 +124,7 @@ type MemoryStorage struct {
 ///
 
 func NewMemoryStorage(source string) *MemoryStorage {
-	src := newOpBlock("", "", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: source}}, 0, 0)
+	src := newOpBlock("SOURCE", "SOURCE", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: source}}, 0, 0)
 	return &MemoryStorage{
 		sourceBlock:   src,
 		latest:        map[string]Sha{},
@@ -343,7 +343,7 @@ func (blk *OpBlock) GetDocument(s *History) *document {
 			blk.setBlockDoc(doc.NewDocument(s.Storage.GetDocument(blk.blockDocHash)))
 		} else {
 			doc := s.GetDocumentForBlocks(blk.getDocumentAncestor(s), blk.Parents)
-			doc.Apply("", 0, blk.Replacements)
+			doc.Apply(blk.replId(), 0, blk.Replacements)
 			blk.setBlockDoc(doc.Freeze())
 			s.Storage.StoreDocument(blk.blockDoc.String())
 		}
@@ -360,6 +360,9 @@ func (blk *OpBlock) GetRawDocument(s *History) *document {
 
 // get the document for an ancestor
 func (blk *OpBlock) getDocumentForAncestor(h *History, ancestor *OpBlock, sel bool) *document {
+	if blk.Hash == ancestor.Hash {
+		return blk.GetDocument(h)
+	}
 	h.GetBlockOrder()
 	if ancestor.Hash == blk.Hash {
 		return blk.GetDocument(h)
@@ -425,11 +428,120 @@ func (blk *OpBlock) applyTo(doc *document) {
 	doc.Apply(id, 0, blk.Replacements)
 }
 
+// parents hashes most likely includes parent.Hash
+func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents []Sha, repl []doc.Replacement, selOff, selLen int) (*OpBlock, []doc.Replacement, error) {
+	if len(parents) == 1 && parent.Hash == parents[0] {
+		return newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repl, selOff, selLen), []doc.Replacement{}, nil
+	}
+	hashStrs := make([]string, len(parents))
+	for i, hash := range parents {
+		hashStrs[i] = hex.EncodeToString(hash[:])
+	}
+	fmt.Printf("COMPUTING BLOCK\n  PARENT: %#v\n  PARENTS: %#v\n  REPLS: %#v\n",
+		parent.replId(),
+		hashStrs,
+		repl,
+	)
+	h.GetBlockOrder()
+	parentSet := doc.NewSet(parents...)
+	parentSet.Add(parent.Hash)
+	ancestor := h.lca(parentSet.ToSlice())
+	if ancestor == nil {
+		return nil, nil, fmt.Errorf("Could not compute block, parents do not have a common ancestor")
+	}
+	// identify edits from merging
+	editId := "edit-" + parent.replId()
+	// save parentPeerDoc for later edit computation
+	fmt.Printf("Ancestor %s\n Parent: %s\n", ancestor.replId(), parent.replId())
+	peerDoc := parent.getDocumentForAncestor(h, ancestor, false)
+	fmt.Printf("PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	original := peerDoc.Freeze()
+	originalIds := original.GetOps().Measure().Ids
+	original.Apply(editId, 0, repl)
+	reverse := original.ReverseEdits()
+	peerDoc.Apply(editId, 0, repl)
+	fmt.Printf("EDITED PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	var pdoc *doc.Document
+	// merge in other edits
+	for _, hash := range parents {
+		if hash == parent.Hash {
+			continue
+		}
+		hdoc := h.GetBlock(hash).getDocumentForAncestor(h, ancestor, false)
+		if pdoc == nil {
+			pdoc = hdoc
+		} else {
+			pdoc.Merge(hdoc)
+		}
+	}
+	// no alterations are needed unless merging occurred
+	editRepl := []doc.Replacement{}
+	if pdoc != nil {
+		fmt.Printf("Merged parents:\n%s\n", pdoc.Changes("  "))
+		// mark peer's selection (if any)
+		if selOff != -1 {
+			markSelection(peerDoc, editId, selOff, selLen)
+		}
+		peerDoc.Merge(pdoc)
+		peerDoc.Simplify()
+		fmt.Printf("FINAL DOC:\n%s\n", peerDoc.Changes("  "))
+		fmt.Printf("REVERSE EDIT: %#v\n", reverse)
+		orepl := repl
+		// transform the replacements
+		repl, selOff, selLen = getReplsForEdits(peerDoc, editId)
+		newIds := peerDoc.GetOps().Measure().Ids.Complement(originalIds)
+		fmt.Printf("COMPUTING REVISION\n  ALL IDS: %s\n  ORIGINAL IDS: %s\n  NEW IDS: %s\n",
+			peerDoc.GetOps().Measure().Ids,
+			originalIds,
+			newIds,
+		)
+		editRepl, _ = peerDoc.EditsFor(newIds, nil)
+		for _, r := range editRepl {
+			reverse = append(reverse, r)
+		}
+		fmt.Printf("COMPUTED REVISED EDITs\n  GIVEN: %#v\n  BLOCK: %#v\n  EDITREPL: %#v\n  REVISED: %#v\n", orepl, repl, editRepl, reverse)
+	}
+	blk := newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repl, selOff, selLen)
+	return blk, reverse, nil
+}
+
+//func cleanRevisedRepl(orig, revised []doc.Replacement) []doc.Replacement {
+//	res := make([]doc.Replacement, 0, len(revised))
+//	oi := 0
+//	ri := 0
+//	offset := 0
+//	for oi < len(orig) {
+//		if orig[oi] == revised[ri] {
+//			offset += len(revised[ri].Text) - revised[ri].Length
+//		} else {
+//			repl := revised[ri]
+//			repl.Offset += offset
+//			res = append(res, repl)
+//		}
+//		oi++
+//		ri++
+//	}
+//}
+
+func getReplsForEdits(document *doc.Document, editId string) ([]doc.Replacement, int, int) {
+	startM := selectionStart(editId)
+	endM := selectionEnd(editId)
+	markers := doc.NewSet(startM, endM)
+	result, resultMarkers := document.EditsFor(doc.NewSet(editId), markers)
+	resultOff := -1
+	resultLen := -1
+	if document.HasMarker(startM) {
+		resultOff = resultMarkers[startM]
+		resultLen = resultMarkers[endM] - resultOff
+	}
+	return result, resultOff, resultLen
+}
+
 // compute edits to reconstruct merged document for a block
 // this is for when the peer just committed the replacements, so
 // it's document state is prevBlock + replacements. Compute the
 // edits necessary to transform it to the merged document.
-func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
+func (blk *OpBlock) old_edits(h *History, selOff, selLen int) ([]Replacement, int, int) {
 	// to get to the merged doc from peer's current doc:
 	// reverse(parent->current)
 	// + reverse(ancestor -> parent)
@@ -446,19 +558,29 @@ func (blk *OpBlock) edits(h *History) ([]Replacement, int, int) {
 	if parent.order < ancestor.order {
 		ancestor = parent
 	}
+	// start at parent and apply replacements to produce current session's doc
 	parentToCurrent := parent.GetDocument(h)
 	blk.applyTo(parentToCurrent)
+	// snapshot current session's document
 	peerDoc := parentToCurrent.Freeze()
-	if blk.SelectionOffset != -1 {
-		markSelection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
+
+	// if there's a selection, add markers to the current session's document
+	//if blk.SelectionOffset != -1 {
+	if selOff != -1 {
+		//markSelection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
+		markSelection(peerDoc, blk.SessionId, selOff, selLen)
 		so, sl := getSelection(peerDoc, blk.SessionId)
-		if so != blk.SelectionOffset || sl != blk.SelectionLength {
+		//if so != blk.SelectionOffset || sl != blk.SelectionLength {
+		if so != selOff || sl != selLen {
 			println("DOCUMENT\n", peerDoc.Changes("  "))
-			panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", blk.SelectionOffset, blk.SelectionLength, so, sl))
+			//panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", blk.SelectionOffset, blk.SelectionLength, so, sl))
+			panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", selOff, selLen, so, sl))
 		}
 	}
 	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
+	// make an editor object to help track changes
 	e := editor{peerDoc, blk.replId(), 0}
+	// reverse session's edits to move selection back to parent
 	e.Apply(parentToCurrent.ReverseEdits())
 	if ancestor.Hash != parent.Hash {
 		ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
@@ -501,7 +623,7 @@ func newTwosha(h1 Sha, h2 Sha) Twosha {
 ///
 
 func NewHistory(storage DocStorage, text string) *History {
-	src := newOpBlock("", "", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
+	src := newOpBlock("SOURCE", "SOURCE", 0, []Sha{}, []Replacement{{Offset: 0, Length: 0, Text: text}}, 0, 0)
 	src.order = 0
 	s := &History{
 		Source:        src,
@@ -586,21 +708,31 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 	if lca != nil && lca.blkA == blkA.Hash && blkA.order == lca.orderA && blkB.order == lca.orderB {
 		return s.GetBlock(lca.ancestor)
 	}
-	// start with the lowest block
-	for i := blkA.order; i >= 0; i-- {
-		anc := s.GetBlock(s.BlockOrder[i])
-		if anc.descendants.Has(blkA.Hash) && anc.descendants.Has(blkB.Hash) {
-			s.LCAs[key] = &LCA{
-				blkA:     blkA.Hash,
-				orderA:   blkA.order,
-				blkB:     blkB.Hash,
-				orderB:   blkB.order,
-				ancestor: anc.Hash,
+	var chosen *OpBlock
+	if blkA.descendants.Has(blkB.Hash) {
+		chosen = blkA
+	} else if blkB.descendants.Has(blkA.Hash) {
+		chosen = blkB
+	} else {
+		// start with the lowest block
+		for i := blkA.order; i >= 0; i-- {
+			anc := s.GetBlock(s.BlockOrder[i])
+			if anc.descendants.Has(blkA.Hash) && anc.descendants.Has(blkB.Hash) {
+				chosen = anc
+				break
 			}
-			return anc
 		}
 	}
-	return nil
+	if chosen != nil {
+		s.LCAs[key] = &LCA{
+			blkA:     blkA.Hash,
+			orderA:   blkA.order,
+			blkB:     blkB.Hash,
+			orderB:   blkB.order,
+			ancestor: chosen.Hash,
+		}
+	}
+	return chosen
 }
 
 // LCA for several nodes (e.g. the parents of a block)
@@ -760,13 +892,17 @@ func SameHashes(a, b []Sha, exclude Sha) bool {
 
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
-func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int, selLen int) ([]Replacement, int, int) {
+func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int, selLen int) ([]Replacement, int, int, error) {
 	parent := h.Latest[sessionId]
+	if parent == nil {
+		parent = h.Source
+		h.Latest[sessionId] = parent
+	}
 	latestHashes := h.LatestHashes()
 	if len(repls) == 0 {
 		if (parent == nil && len(h.Latest) == 0) || parent != nil && SameHashes(latestHashes, parent.Parents, parent.Hash) {
 			// no changes
-			return []Replacement{}, selOff, selLen
+			return []Replacement{}, selOff, selLen, nil
 		}
 	}
 	excluded := doc.Set[Sha]{}
@@ -792,28 +928,16 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 		}
 	}
 	sortHashes(parents)
-	blk := newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repls, selOff, selLen)
-	start := selectionStart(blk.SessionId)
-	end := selectionEnd(blk.SessionId)
-	markArgs := ([]string{start, end})[:]
-	if selOff == -1 {
-		markArgs = markArgs[:0]
+	if len(repls) == 0 && parents == parent.Parents {
+		return repls, selOff, selLen
 	}
-	repls, markers := blk.GetRawDocument(h).EditsFor(blk.replId(), markArgs...)
-	blk.Replacements = repls
-	if selOff != -1 {
-		blk.SelectionOffset = markers[start]
-		blk.SelectionLength = markers[end] - markers[start]
-	} else {
-		blk.SelectionOffset = -1
-		blk.SelectionLength = -1
+	blk, edits, err := parent.computeBlock(h, peer, sessionId, parents, repls, selOff, selLen)
+	if err != nil {
+		return nil, 0, 0, err
 	}
+	fmt.Printf("EDITED, REPL: %#v\n", edits)
 	h.addBlock(blk)
-	r, rSelOff, rSelLen := blk.edits(h)
-	if blk.SelectionOffset != rSelOff || blk.SelectionLength != rSelLen {
-		panic(fmt.Sprintf("Error in new block selections:\n  given sel: %-5d len: %-5d\n  result sel: %-5d len: %-5d\n  new sel: %-5d, len: %-5d", selOff, selLen, rSelOff, rSelLen, blk.SelectionOffset, blk.SelectionLength))
-	}
-	return r, selOff, selLen
+	return edits, blk.SelectionOffset, blk.SelectionLength, nil
 }
 
 // set the Selection for peer

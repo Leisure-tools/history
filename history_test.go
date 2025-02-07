@@ -135,6 +135,12 @@ func (t myT) testEqual(actual any, expected any, msg string) {
 }
 
 func testEqual(t myT, actual any, expected any, msg string) {
+	if s, ok := actual.(string); ok {
+		actual = strings.ReplaceAll(s, "\n", "\\n")
+	}
+	if s, ok := expected.(string); ok {
+		expected = strings.ReplaceAll(s, "\n", "\\n")
+	}
 	t.failIfNot(actual == expected, fmt.Sprintf("%s: expected <%v> but got <%v>", msg, expected, actual))
 }
 
@@ -249,17 +255,25 @@ func commitEdits(t myT, s *testSession, doc *document, expected []Replacement, e
 }
 
 func commitReplacements(t myT, p *testSession, edits []Replacement, expected []Replacement, expectedDoc string) {
-	p.Commit(edits, 0, 0)
-	//repl, _, _ := s.Commit(0, 0)
+	//repl, _, _ := p.Commit(edits, 0, 0)
 	//testEqualRepls(t, repl, expected, "replacements did not match after commit")
-	latest := p.History.Latest[p.sessionId]
-	prev := latest.SessionParent(p.History)
-	if prev == nil {
-		prev = p.History.Source
-	}
-	anc := latest.getDocumentForAncestor(p.History, prev, false)
-	testEqualRepls(t, anc.Edits(), expected, "ancestor edits did not match")
-	testEqual(t, anc.String(), expectedDoc, "committed doc did not match")
+
+	editDoc := p.doc().Freeze()
+	repl, _, _ := p.Commit(edits, 0, 0)
+	editDoc.Apply("edits", 0, edits)
+	editDoc.Apply("result", 0, repl)
+	fmt.Printf("EDITS\n  INPUT: %#v\n  OUTPUT: %#v\n", edits, repl)
+	testEqual(t, editDoc.String(), expectedDoc, "replacements did not match after commit")
+
+	//p.Commit(edits, 0, 0)
+	//latest := p.History.Latest[p.sessionId]
+	//prev := latest.SessionParent(p.History)
+	//if prev == nil {
+	//	prev = p.History.Source
+	//}
+	//anc := latest.getDocumentForAncestor(p.History, prev, false)
+	//testEqualRepls(t, anc.Edits(), expected, "ancestor edits did not match")
+	//testEqual(t, anc.String(), expectedDoc, "committed doc did not match")
 }
 
 func addBlock(t myT, s *testSession, blk *OpBlock, expected string) {
@@ -277,8 +291,13 @@ func addBlock(t myT, s *testSession, blk *OpBlock, expected string) {
 	testEqual(t, anc.OriginalString(), ancestorDoc.String(), "ancestor doc did not match")
 }
 
+func (s *testSession) checkError(err error, msg string) {
+	s.testEqual(err, nil, fmt.Sprintf("%s: %s", msg, fmt.Sprint(err)))
+}
+
 func (s *testSession) Commit(repls []Replacement, selOff, selLen int) ([]Replacement, int, int) {
-	repl, selOff, selLen := s.History.Commit(s.peer, s.sessionId, repls, selOff, selLen)
+	repl, selOff, selLen, err := s.History.Commit(s.peer, s.sessionId, repls, selOff, selLen)
+	s.checkError(err, "Error committing replacements")
 	s.verifyEdits()
 	return repl, selOff, selLen
 }
@@ -382,10 +401,39 @@ func clearHistoryCache(histories ...*History) {
 
 func newTestPeer(t myT, peer, sessionId, doc string) *testSession {
 	ch := NewHistory(NewMemoryStorage(doc), doc)
-	p := &testSession{t, nil, ch, peer, sessionId, 0}
+	p := &testSession{
+		myT:       t,
+		History:   ch,
+		peer:      peer,
+		sessionId: sessionId,
+		nonce:     0,
+	}
 	testBlockOrder(t, p, 1, 1)
 	clearHistoryCache(ch)
+	ch.Latest[sessionId] = ch.Source
+	testEqual(t, p.doc().String(), doc, fmt.Sprintf("Bad document, expected <%s> but got <%s>\n", doc, p.doc()))
 	return p
+}
+
+func TestBasic(tt *testing.T) {
+	t := myT{tt}
+	tp := t.newTwoSessions("session1", "session2", "one\ntwo\n")
+	commitReplacements(t, tp.s1,
+		[]Replacement{{Offset: 4, Length: 4, Text: "THREE\n"}},
+		[]Replacement{},
+		"one\nTHREE\n")
+	t.testEqual(tp.history.Latest["session1"].Hash, tp.history.BlockOrder[len(tp.history.BlockOrder)-1],
+		"Bad latest block for session1")
+	t.testEqual(tp.s1.doc().String(), "one\nTHREE\n",
+		"Bad document for session1",
+	)
+	t.testEqual(tp.s2.doc().String(), "one\ntwo\n",
+		"Bad document for session1",
+	)
+	commitReplacements(t, tp.s2,
+		[]Replacement{{Offset: 4, Length: 4, Text: "FOUR\n"}},
+		[]Replacement{},
+		"one\nTHREE\nFOUR\n")
 }
 
 func TestEditing(tt *testing.T) {
@@ -494,7 +542,15 @@ func (t myT) newTwoSessions(session1, session2, doc string) *twoSessions {
 		sessionId:   session2,
 	}
 	tp.addBlock(h.Source)
+	h.Latest[session1] = h.Source
+	h.Latest[session2] = h.Source
+	t.testEqual(tp.s1.doc().String(), doc, "bad document for session "+session1)
+	t.testEqual(tp.s2.doc().String(), doc, "bad document for session "+session2)
 	return tp
+}
+
+func (s *testSession) doc() *doc.Document {
+	return s.Latest[s.sessionId].GetDocument(s.History)
 }
 
 func (tp *twoSessions) addBlock(blk *OpBlock) {
