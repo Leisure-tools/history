@@ -437,11 +437,11 @@ func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents 
 	for i, hash := range parents {
 		hashStrs[i] = hex.EncodeToString(hash[:])
 	}
-	fmt.Printf("COMPUTING BLOCK\n  PARENT: %#v\n  PARENTS: %#v\n  REPLS: %#v\n",
-		parent.replId(),
-		hashStrs,
-		repl,
-	)
+	//fmt.Printf("COMPUTING BLOCK\n  PARENT: %#v\n  PARENTS: %#v\n  REPLS: %#v\n",
+	//	parent.replId(),
+	//	hashStrs,
+	//	repl,
+	//)
 	h.GetBlockOrder()
 	parentSet := doc.NewSet(parents...)
 	parentSet.Add(parent.Hash)
@@ -452,15 +452,16 @@ func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents 
 	// identify edits from merging
 	editId := "edit-" + parent.replId()
 	// save parentPeerDoc for later edit computation
-	fmt.Printf("Ancestor %s\n Parent: %s\n", ancestor.replId(), parent.replId())
+	//fmt.Printf("Ancestor %s\n Parent: %s\n", ancestor.replId(), parent.replId())
 	peerDoc := parent.getDocumentForAncestor(h, ancestor, false)
-	fmt.Printf("PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	//fmt.Printf("PARENT DOC\n%s\n", peerDoc.Changes("  "))
 	original := peerDoc.Freeze()
-	originalIds := original.GetOps().Measure().Ids
 	original.Apply(editId, 0, repl)
 	reverse := original.ReverseEdits()
+	editorDoc := peerDoc.Copy()
 	peerDoc.Apply(editId, 0, repl)
-	fmt.Printf("EDITED PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	originalIds := peerDoc.GetOps().Measure().Ids
+	//fmt.Printf("EDITED PARENT DOC\n%s\n", peerDoc.Changes("  "))
 	var pdoc *doc.Document
 	// merge in other edits
 	for _, hash := range parents {
@@ -477,32 +478,39 @@ func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents 
 	// no alterations are needed unless merging occurred
 	editRepl := []doc.Replacement{}
 	if pdoc != nil {
-		fmt.Printf("Merged parents:\n%s\n", pdoc.Changes("  "))
+		//fmt.Printf("Merged parents:\n%s\n", pdoc.Changes("  "))
 		// mark peer's selection (if any)
 		if selOff != -1 {
 			markSelection(peerDoc, editId, selOff, selLen)
 		}
 		peerDoc.Merge(pdoc)
 		peerDoc.Simplify()
-		fmt.Printf("FINAL DOC:\n%s\n", peerDoc.Changes("  "))
-		fmt.Printf("REVERSE EDIT: %#v\n", reverse)
+		//fmt.Printf("FINAL DOC:\n%s\n", peerDoc.Changes("  "))
+		//fmt.Printf("REVERSE EDIT: %#v\n", reverse)
 		orepl := repl
 		// transform the replacements
 		repl, selOff, selLen = getReplsForEdits(peerDoc, editId)
-		newIds := peerDoc.GetOps().Measure().Ids.Complement(originalIds)
-		fmt.Printf("COMPUTING REVISION\n  ALL IDS: %s\n  ORIGINAL IDS: %s\n  NEW IDS: %s\n",
-			peerDoc.GetOps().Measure().Ids,
-			originalIds,
-			newIds,
-		)
-		editRepl, _ = peerDoc.EditsFor(newIds, nil)
-		for _, r := range editRepl {
-			reverse = append(reverse, r)
-		}
-		fmt.Printf("COMPUTED REVISED EDITs\n  GIVEN: %#v\n  BLOCK: %#v\n  EDITREPL: %#v\n  REVISED: %#v\n", orepl, repl, editRepl, reverse)
+
+		editorId := "\x00edit-repl-" + parent.replId()
+		//fmt.Printf("EDITOR DOC - INITIAL\n%s", editorDoc.Changes("  "))
+		editorDoc.Apply(editorId, 0, orepl)
+		//fmt.Printf("EDITOR DOC - AFTER ORIGINAL REPL\n%s", editorDoc.Changes("  "))
+		originalIds = editorDoc.GetOps().Measure().Ids
+		editorId2 := "\x00reverse-edit-repl-" + parent.replId()
+		editorDoc.Apply(editorId2, 0, reverse)
+		//fmt.Printf("EDITOR DOC - AFTER REVERSE REPL\n%s", editorDoc.Changes("  "))
+		editorId3 := "\x00forward-edit-repl-" + parent.replId()
+		editorDoc.Apply(editorId3, 0, orepl)
+		//fmt.Printf("EDITOR DOC - AFTER FORWARD REPL\n%s", editorDoc.Changes("  "))
+		editorDoc.Merge(pdoc)
+		//fmt.Printf("EDITOR DOC - AFTER MERGE\n%s", editorDoc.Changes("  "))
+		editorDoc.Simplify()
+		//fmt.Printf("EDITOR DOC - AFTER SIMPLIFY\n%s", editorDoc.Changes("  "))
+		editRepl, _ = editorDoc.EditsFor(editorDoc.GetOps().Measure().Ids.Complement(originalIds), nil)
+		//fmt.Printf("COMPUTED REVISED EDITs\n  GIVEN: %#v\n  BLOCK: %#v\n  EDITREPL: %#v\n  REVERSE: %#v\n", orepl, repl, editRepl, reverse)
 	}
 	blk := newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repl, selOff, selLen)
-	return blk, reverse, nil
+	return blk, editRepl, nil
 }
 
 //func cleanRevisedRepl(orig, revised []doc.Replacement) []doc.Replacement {
@@ -908,13 +916,13 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 	excluded := doc.Set[Sha]{}
 	for i, p := range latestHashes {
 		if !excluded.Has(p) {
-			parent := h.GetBlock(p)
+			par := h.GetBlock(p)
 			for _, c := range latestHashes[i+1:] {
 				if !excluded.Has(c) {
 					child := h.GetBlock(c)
 					if child.descendants.Has(p) {
 						excluded.Add(c)
-					} else if parent.descendants.Has(c) {
+					} else if par.descendants.Has(c) {
 						excluded.Add(p)
 					}
 				}
@@ -927,10 +935,17 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 			parents = append(parents, p)
 		}
 	}
-	sortHashes(parents)
-	if len(repls) == 0 && parents == parent.Parents {
-		return repls, selOff, selLen
+	if len(repls) == 0 && parent != nil {
+		grandSet := doc.NewSet(parent.Parents...)
+		parentSet := doc.NewSet(parents...)
+		parentSet.Remove(parent.Hash)
+		parentSet.Subtract(grandSet)
+		if len(parentSet) == 0 {
+			// no changes
+			return []Replacement{}, selOff, selLen, nil
+		}
 	}
+	sortHashes(parents)
 	blk, edits, err := parent.computeBlock(h, peer, sessionId, parents, repls, selOff, selLen)
 	if err != nil {
 		return nil, 0, 0, err

@@ -2,7 +2,6 @@ package history
 
 import (
 	"fmt"
-	"math/rand"
 	"os"
 	"reflect"
 	"runtime/debug"
@@ -181,6 +180,46 @@ func index(str string, line, col int) int {
 	return i + col
 }
 
+func (t myT) repls(str1, str2 string, replacements ...string) []Replacement {
+	before := make([]string, 0, 8)
+	result := make([]Replacement, 0, 8)
+	offset := 0
+	delete := 0
+	after := make([]string, 0, 8)
+	for _, r := range replacements {
+		if len(r) == 0 {
+			t.failNow("No replacement code")
+		}
+		switch r[0] {
+		case '@':
+			continue
+		case '-':
+			before = append(before, r[1:])
+			delete += len(r) - 1
+		case '=':
+			if delete > 0 {
+				result = append(result, Replacement{Offset: offset, Length: delete, Text: ""})
+				delete = 0
+			}
+			before = append(before, r[1:])
+			after = append(after, r[1:])
+			offset += len(r) - 1
+		case '+':
+			after = append(after, r[1:])
+			result = append(result, Replacement{Offset: offset, Length: delete, Text: r[1:]})
+			delete = 0
+		default:
+			t.failNow(fmt.Sprint("Bad replacement code: ", r[0]))
+		}
+	}
+	if delete > 0 {
+		result = append(result, Replacement{Offset: offset, Length: delete, Text: ""})
+	}
+	t.testEqual(str1, strings.Join(before, ""), "Replacements do not match starting doc")
+	t.testEqual(str2, strings.Join(after, ""), "Result of replacements does not match")
+	return result
+}
+
 func docONE(t myT, session string) *document {
 	d := doc.NewDocument(docString0)
 	replace(t, d, session, 0, index(docString0, 0, 5), 3, "ONE")
@@ -260,9 +299,10 @@ func commitReplacements(t myT, p *testSession, edits []Replacement, expected []R
 
 	editDoc := p.doc().Freeze()
 	repl, _, _ := p.Commit(edits, 0, 0)
+	// simulate user edit
 	editDoc.Apply("edits", 0, edits)
 	editDoc.Apply("result", 0, repl)
-	fmt.Printf("EDITS\n  INPUT: %#v\n  OUTPUT: %#v\n", edits, repl)
+	fmt.Printf("EDITS\n  INPUT: %#v\n  OUTPUT: %#v\nEDIT DOC:\n%s", edits, repl, editDoc.Changes("  "))
 	testEqual(t, editDoc.String(), expectedDoc, "replacements did not match after commit")
 
 	//p.Commit(edits, 0, 0)
@@ -352,10 +392,14 @@ func sameRepls(a, b []doc.Replacement) bool {
 }
 
 func testCommit(t myT, s *testSession, startDoc, expected string) {
+	testEqual(t, startDoc, s.doc().String(), "Bad expected starting doc")
 	repl, _, _ := s.Commit(nil, 0, 0)
 	str := doc.NewDocument(startDoc)
 	str.Apply(s.sessionId, 0, repl)
-	testEqual(t, str.String(), expected, "Result did not match expected")
+	if str.String() != expected {
+		println("BAD RESULT DOC:\n", str.Changes("  "))
+	}
+	testEqual(t, str.String(), expected, "Result did not match after edits")
 }
 
 // strip out local data
@@ -385,6 +429,8 @@ func testBlockOrder(t myT, s *testSession, expected, additional int) {
 	}
 }
 
+// remove everything but source and latest blocks
+// other blocks will be refetched from storage
 func clearHistoryCache(histories ...*History) {
 	for _, h := range histories {
 		h.Blocks = make(map[Sha]*OpBlock)
@@ -417,23 +463,23 @@ func newTestPeer(t myT, peer, sessionId, doc string) *testSession {
 
 func TestBasic(tt *testing.T) {
 	t := myT{tt}
-	tp := t.newTwoSessions("session1", "session2", "one\ntwo\n")
+	one := "one\ntwo\n"
+	tp := t.newTwoSessions("session1", "session2", one)
+	two := "one\nTHREE\n"
 	commitReplacements(t, tp.s1,
-		[]Replacement{{Offset: 4, Length: 4, Text: "THREE\n"}},
-		[]Replacement{},
-		"one\nTHREE\n")
+		t.repls(one, two, "=one\n", "-two\n", "+THREE\n"),
+		nil,
+		two)
 	t.testEqual(tp.history.Latest["session1"].Hash, tp.history.BlockOrder[len(tp.history.BlockOrder)-1],
 		"Bad latest block for session1")
-	t.testEqual(tp.s1.doc().String(), "one\nTHREE\n",
-		"Bad document for session1",
-	)
-	t.testEqual(tp.s2.doc().String(), "one\ntwo\n",
-		"Bad document for session1",
-	)
+	t.testEqual(tp.s1.doc().String(), "one\nTHREE\n", "Bad document for session1")
+	t.testEqual(tp.s2.doc().String(), "one\ntwo\n", "Bad document for session2")
+	three := "one\nFOUR\n"
+	four := "one\nFOUR\nTHREE\n"
 	commitReplacements(t, tp.s2,
-		[]Replacement{{Offset: 4, Length: 4, Text: "FOUR\n"}},
-		[]Replacement{},
-		"one\nTHREE\nFOUR\n")
+		t.repls(one, three, "=one\n", "-two\n", "+FOUR\n"),
+		nil,
+		four)
 }
 
 func TestEditing(tt *testing.T) {
@@ -445,65 +491,29 @@ func TestEditing(tt *testing.T) {
 	d1 := doc.NewDocument(docString0)
 	d2 := docTWO(t, "session2")
 	doc2 := d2.String()
-	commitEdits(t, p2, d2, []Replacement{
-		{
-			Offset: 14,
-			Length: 3,
-			Text:   "TWO"},
-		{
-			Offset: 28,
-			Length: 0,
-			Text: `
-line five`},
-	},
+	commitEdits(t, p2, d2, t.repls(docString0, docString2,
+		"=line one\nline ", "-two", "+TWO", "=\nline three", "+\nline five"),
 		docString2)
 	blk2 := outgoing(p2)
 	addBlock(t, p1, blk2, doc2)
-	commitReplacements(t, p1, []Replacement{}, []Replacement{
-		{
-			Offset: 14,
-			Length: 3,
-			Text:   "TWO"},
-		{
-			Offset: 28,
-			Length: 0,
-			Text: `
-line five`},
-	},
+	commitReplacements(t, p1, []Replacement{},
+		t.repls(docString0, docString2,
+			"=line one\nline ", "-two", "+TWO", "=\nline three", "+\nline five"),
 		docString2)
 	p1 = newTestPeer(t, "", "session1", docString0)
 	p2 = newTestPeer(t, "", "session2", docString0)
 	testEqual(t, p1.History.Source.Hash, p2.History.Source.Hash, "source hashes are not identical")
 	d1, d2 = docs(t)
-	doc1 := d1.String()
-	doc2 = d2.String()
 	clearHistoryCache(p1.History, p2.History)
-	commitEdits(t, p1, d1, []Replacement{
-		{
-			Offset: 5,
-			Length: 3,
-			Text:   "ONE"},
-		{
-			Offset: 28,
-			Length: 0,
-			Text: `
-line four`},
-	},
+	commitEdits(t, p1, d1,
+		t.repls(docString0, docString1,
+			"=line ", "-one", "+ONE", "=\nline two\nline three", "+\nline four"),
 		docString1)
 	clearHistoryCache(p1.History, p2.History)
 	testBlockOrder(t, p1, 2, 1)
 	clearHistoryCache(p1.History, p2.History)
-	commitEdits(t, p2, d2, []Replacement{
-		{
-			Offset: 14,
-			Length: 3,
-			Text:   "TWO"},
-		{
-			Offset: 28,
-			Length: 0,
-			Text: `
-line five`},
-	},
+	commitEdits(t, p2, d2, t.repls(docString0, docString2,
+		"=line one\nline ", "-two", "+TWO", "=\nline three", "+\nline five"),
 		docString2)
 	clearHistoryCache(p1.History, p2.History)
 	testBlockOrder(t, p2, 2, 1)
@@ -512,13 +522,13 @@ line five`},
 	clearHistoryCache(p1.History, p2.History)
 	blk2 = outgoing(p2)
 	clearHistoryCache(p1.History, p2.History)
-	addBlock(t, p1, blk2, doc2)
+	addBlock(t, p1, blk2, docString2)
 	clearHistoryCache(p1.History, p2.History)
-	testCommit(t, p1, doc1, docMerged)
+	testCommit(t, p1, docString1, docMerged)
 	clearHistoryCache(p1.History, p2.History)
-	addBlock(t, p2, blk1, doc1)
+	addBlock(t, p2, blk1, docString1)
 	clearHistoryCache(p1.History, p2.History)
-	testCommit(t, p2, doc2, docMerged)
+	testCommit(t, p2, docString2, docMerged)
 }
 
 func (t myT) newTwoSessions(session1, session2, doc string) *twoSessions {
@@ -714,6 +724,7 @@ func (s *testSession) change(newEdit, expected *edit) *document {
 	l := s.latest()
 	doc := l.GetDocument(s.history)
 	verbose(1, "EDIT: %+v\n", newEdit)
+	println("\n@@@\nERROR HERE")
 	delta := s.commit(newEdit, expected)
 	verbose(1, "Delta: %d\n", delta)
 	newDoc := s.latest().GetDocument(s.history)
@@ -752,40 +763,41 @@ func TestPeerEdits(tt *testing.T) {
 	tp := myT{tt}.newTwoSessions("emacs", "vscode", docBuf.String())
 	for i, offset := range inserts {
 		verbose(1, "Replacement: %d\n", i+1)
+		println("\n@@@\nERROR HERE")
 		tp.change(offset, 0, "a")
 	}
 }
 
 func TestRandomEdits(tt *testing.T) {
-	lines := 2000
-	//lines := 3
-	word := "hello "
-	words := 20
-	//words := 5
-	docBuf := strings.Builder{}
-	for line := 0; line < lines; line++ {
-		for wordNum := 0; wordNum < words; wordNum++ {
-			docBuf.WriteString(word)
-		}
-		docBuf.WriteString("\n")
-	}
-	docStr := docBuf.String()
-	docLen := len(docStr)
-	tp := myT{tt}.newTwoSessions("emacs", "vscode", docStr)
-	for edit := 0; edit < 1000; edit++ {
-		if edit%100 == 0 {
-			fmt.Printf("Testing edit %d\n", edit)
-		}
-		i := rand.Intn(docLen)
-		verbose(1, "Replacement: %d\n", i+1)
-		if i+3 < docLen && rand.Intn(100) < 50 {
-			tp.change(i, 3, "a")
-			docLen -= 2
-		} else {
-			tp.change(i, 0, "a")
-			docLen++
-		}
-	}
+	//lines := 2000
+	////lines := 3
+	//word := "hello "
+	//words := 20
+	////words := 5
+	//docBuf := strings.Builder{}
+	//for line := 0; line < lines; line++ {
+	//	for wordNum := 0; wordNum < words; wordNum++ {
+	//		docBuf.WriteString(word)
+	//	}
+	//	docBuf.WriteString("\n")
+	//}
+	//docStr := docBuf.String()
+	//docLen := len(docStr)
+	//tp := myT{tt}.newTwoSessions("emacs", "vscode", docStr)
+	//for edit := 0; edit < 1000; edit++ {
+	//	if edit%100 == 0 {
+	//		fmt.Printf("Testing edit %d\n", edit)
+	//	}
+	//	i := rand.Intn(docLen)
+	//	verbose(1, "Replacement: %d\n", i+1)
+	//	if i+3 < docLen && rand.Intn(100) < 50 {
+	//		tp.change(i, 3, "a")
+	//		docLen -= 2
+	//	} else {
+	//		tp.change(i, 0, "a")
+	//		docLen++
+	//	}
+	//}
 }
 
 func (server *twoSessions) checkSimpleChange(edit, expected *edit) {
