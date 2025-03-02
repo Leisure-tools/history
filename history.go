@@ -575,10 +575,10 @@ func NewHistory(storage DocStorage, text string) *History {
 	return s
 }
 
-func (s *History) Verbose(format string, args ...any) { s.VerboseN(1, format, args...) }
+func (h *History) Verbose(format string, args ...any) { h.VerboseN(1, format, args...) }
 
-func (s *History) VerboseN(level int, format string, args ...any) {
-	if level <= s.Verbosity {
+func (h *History) VerboseN(level int, format string, args ...any) {
+	if level <= h.Verbosity {
 		if format[len(format)-1] != '\n' {
 			format += "\n"
 		}
@@ -586,43 +586,43 @@ func (s *History) VerboseN(level int, format string, args ...any) {
 	}
 }
 
-func (s *History) AddListener(l HistoryListener) {
-	if s.Listeners == nil {
-		s.Listeners = make([]HistoryListener, 0, 8)
+func (h *History) AddListener(l HistoryListener) {
+	if h.Listeners == nil {
+		h.Listeners = make([]HistoryListener, 0, 8)
 	}
-	s.Listeners = append(s.Listeners, l)
+	h.Listeners = append(h.Listeners, l)
 }
 
-func (s *History) fireNewHeads() {
-	for _, l := range s.Listeners {
-		l.NewHeads(s)
+func (h *History) fireNewHeads() {
+	for _, l := range h.Listeners {
+		l.NewHeads(h)
 	}
 }
 
-func (s *History) LatestBlock(sessionId string) *OpBlock {
-	blk := s.Latest[sessionId]
+func (h *History) LatestBlock(sessionId string) *OpBlock {
+	blk := h.Latest[sessionId]
 	if blk == nil {
-		blk = s.Source
+		blk = h.Source
 	}
 	return blk
 }
 
-func (s *History) GetDocument(hash Sha) string {
-	return s.Storage.GetDocument(hash)
+func (h *History) GetDocument(hash Sha) string {
+	return h.Storage.GetDocument(hash)
 }
 
-func (s *History) GetLatestDocument() *document {
-	latest := s.Heads()
-	ancestor := s.lca(latest)
-	return s.GetDocumentForBlocks(ancestor, latest)
+func (h *History) GetLatestDocument() *document {
+	latest := h.Heads()
+	ancestor := h.lca(latest)
+	return h.GetDocumentForBlocks(ancestor, latest)
 }
 
-func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *document {
-	doc := ancestor.GetDocument(s).Copy()
+func (h *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *document {
+	doc := ancestor.GetDocument(h).Copy()
 	for _, hash := range hashes {
-		parent := s.GetBlock(hash)
+		parent := h.GetBlock(hash)
 		if parent != ancestor {
-			parentDoc := parent.getDocumentForAncestor(s, ancestor, false)
+			parentDoc := parent.getDocumentForAncestor(h, ancestor, false)
 			doc.Merge(parentDoc)
 		}
 	}
@@ -631,12 +631,12 @@ func (s *History) GetDocumentForBlocks(ancestor *OpBlock, hashes []Sha) *documen
 
 // deterministically compute block order
 // children are sorted by hash at each step
-func (s *History) recomputeBlockOrder() {
+func (h *History) recomputeBlockOrder() {
 	// number blocks in breadth-first order from the source by children
 	cur := make([]Sha, 0, 8)
-	next := append(make([]Sha, 0, 8), s.Source.Hash)
+	next := append(make([]Sha, 0, 8), h.Source.Hash)
 	seen := doc.Set[Sha]{}
-	s.BlockOrder = s.BlockOrder[:0]
+	h.BlockOrder = h.BlockOrder[:0]
 	for len(next) > 0 {
 		cur, next = next, cur[:0]
 		for _, hash := range cur {
@@ -644,29 +644,29 @@ func (s *History) recomputeBlockOrder() {
 				continue
 			}
 			seen.Add(hash)
-			blk := s.GetBlock(hash)
-			blk.order = len(s.BlockOrder)
-			s.BlockOrder = append(s.BlockOrder, hash)
+			blk := h.GetBlock(hash)
+			blk.order = len(h.BlockOrder)
+			h.BlockOrder = append(h.BlockOrder, hash)
 			sortHashes(blk.children)
 			next = append(next, blk.children...)
 		}
 	}
 	// clear LCA cache
-	s.LCAs = map[Twosha]*LCA{}
+	h.LCAs = map[Twosha]*LCA{}
 }
 
 // these are cached; when new blocks come in from outside,
 // they can cause renumbering, which clears the cache
-func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
-	s.GetBlockOrder()
+func (h *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
+	h.GetBlockOrder()
 	// ensure blkA is the lower block
 	if blkB.order < blkA.order {
 		blkA, blkB = blkB, blkA
 	}
 	key := newTwosha(blkA.Hash, blkB.Hash)
-	lca := s.LCAs[key]
+	lca := h.LCAs[key]
 	if lca != nil && lca.blkA == blkA.Hash && blkA.order == lca.orderA && blkB.order == lca.orderB {
-		return s.GetBlock(lca.ancestor)
+		return h.GetBlock(lca.ancestor)
 	}
 	var chosen *OpBlock
 	if blkA.descendants.Has(blkB.Hash) {
@@ -676,7 +676,7 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 	} else {
 		// start with the lowest block
 		for i := blkA.order; i >= 0; i-- {
-			anc := s.GetBlock(s.BlockOrder[i])
+			anc := h.GetBlock(h.BlockOrder[i])
 			if anc.descendants.Has(blkA.Hash) && anc.descendants.Has(blkB.Hash) {
 				chosen = anc
 				break
@@ -684,7 +684,7 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 		}
 	}
 	if chosen != nil {
-		s.LCAs[key] = &LCA{
+		h.LCAs[key] = &LCA{
 			blkA:     blkA.Hash,
 			orderA:   blkA.order,
 			blkB:     blkB.Hash,
@@ -696,23 +696,23 @@ func (s *History) lca2(blkA *OpBlock, blkB *OpBlock) *OpBlock {
 }
 
 // LCA for several nodes (e.g. the parents of a block)
-func (s *History) lca(hashes []Sha) *OpBlock {
+func (h *History) lca(hashes []Sha) *OpBlock {
 	blocks := make([]*OpBlock, 0, len(hashes))
 	for _, block := range hashes {
-		blocks = append(blocks, s.GetBlock(block))
+		blocks = append(blocks, h.GetBlock(block))
 	}
 	if len(blocks) == 1 {
 		return blocks[0]
 	} else if len(blocks) == 2 {
-		return s.lca2(blocks[0], blocks[1])
+		return h.lca2(blocks[0], blocks[1])
 	}
 	// more than 2 inputs
 	// the result cannot be higher than any pairwise LCA
 	// find highest block with all inputs as descendants, starting with the first pairwise LCA
 	// (hashes tends to have sorted shas, which are reasonably random)
 LCA:
-	for index := s.lca2(blocks[0], blocks[1]).order; index >= 0; index-- {
-		anc := s.GetBlock(s.BlockOrder[index])
+	for index := h.lca2(blocks[0], blocks[1]).order; index >= 0; index-- {
+		anc := h.GetBlock(h.BlockOrder[index])
 		for _, hash := range hashes {
 			if !anc.descendants.Has(hash) {
 				continue LCA
@@ -723,39 +723,39 @@ LCA:
 	return nil
 }
 
-func (s *History) GetBlock(hash Sha) *OpBlock {
-	if s.Blocks[hash] != nil {
-		return s.Blocks[hash]
-	} else if s.PendingBlocks[hash] != nil {
-		return s.PendingBlocks[hash]
-	} else if blk := s.Storage.GetBlock(hash); blk != nil {
+func (h *History) GetBlock(hash Sha) *OpBlock {
+	if h.Blocks[hash] != nil {
+		return h.Blocks[hash]
+	} else if h.PendingBlocks[hash] != nil {
+		return h.PendingBlocks[hash]
+	} else if blk := h.Storage.GetBlock(hash); blk != nil {
 		return blk
 	}
-	return s.Storage.GetPendingBlock(hash)
+	return h.Storage.GetPendingBlock(hash)
 }
 
-func (s *History) hasBlock(hash Sha) bool {
-	return s.Blocks[hash] != nil || s.Storage.HasBlock(hash)
+func (h *History) hasBlock(hash Sha) bool {
+	return h.Blocks[hash] != nil || h.Storage.HasBlock(hash)
 }
 
-func (s *History) hasPendingBlock(hash Sha) bool {
-	return s.PendingBlocks[hash] != nil || s.Storage.HasPendingBlock(hash)
+func (h *History) hasPendingBlock(hash Sha) bool {
+	return h.PendingBlocks[hash] != nil || h.Storage.HasPendingBlock(hash)
 }
 
-func (s *History) getPendingOn(hash Sha) doc.Set[*OpBlock] {
-	if s.PendingOn[hash] == nil {
-		pending := s.Storage.GetPendingOn(hash)
+func (h *History) getPendingOn(hash Sha) doc.Set[*OpBlock] {
+	if h.PendingOn[hash] == nil {
+		pending := h.Storage.GetPendingOn(hash)
 		if pending != nil {
 			blocks := make(doc.Set[Sha], len(pending))
 			for _, hash := range pending {
 				blocks.Add(hash)
 			}
-			s.PendingOn[hash] = blocks
+			h.PendingOn[hash] = blocks
 		}
 	}
-	result := make(doc.Set[*OpBlock], len(s.PendingOn[hash]))
-	for hash := range s.PendingOn[hash] {
-		result.Add(s.GetBlock(hash))
+	result := make(doc.Set[*OpBlock], len(h.PendingOn[hash]))
+	for hash := range h.PendingOn[hash] {
+		result.Add(h.GetBlock(hash))
 	}
 	return result
 }
@@ -766,55 +766,55 @@ func sortHashes(hashes []Sha) {
 	})
 }
 
-func (s *History) addBlock(blk *OpBlock) {
+func (h *History) addBlock(blk *OpBlock) {
 	if len(blk.Parents) == 0 {
 		panic("Adding block with not parents")
 	}
 	seen := doc.NewSet(blk.Hash)
-	s.Blocks[blk.Hash] = blk
-	s.Storage.StoreBlock(blk)
+	h.Blocks[blk.Hash] = blk
+	h.Storage.StoreBlock(blk)
 	for _, parentHash := range blk.Parents {
-		parent := s.GetBlock(parentHash)
+		parent := h.GetBlock(parentHash)
 		parent.children = append(parent.children, blk.Hash)
-		s.Storage.AddChild(parent, blk.Hash)
-		parent.addToDescendants(s, blk.Hash, seen)
+		h.Storage.AddChild(parent, blk.Hash)
+		parent.addToDescendants(h, blk.Hash, seen)
 	}
-	s.Latest[blk.SessionId] = blk
-	s.Storage.SetLatest(blk.SessionId, blk)
-	count := s.Storage.GetBlockCount()
+	h.Latest[blk.SessionId] = blk
+	h.Storage.SetLatest(blk.SessionId, blk)
+	count := h.Storage.GetBlockCount()
 	for _, hash := range blk.Parents {
-		if s.GetBlock(hash).order == count-1 {
+		if h.GetBlock(hash).order == count-1 {
 			blk.order = count
-			if s.BlockOrder != nil {
-				s.BlockOrder = append(s.BlockOrder, blk.Hash)
+			if h.BlockOrder != nil {
+				h.BlockOrder = append(h.BlockOrder, blk.Hash)
 			}
 			return
 		}
 	}
 	// none of the parents had order == len(s.blocks)-1
-	s.BlockOrder = s.BlockOrder[:0]
-	s.fireNewHeads()
+	h.BlockOrder = h.BlockOrder[:0]
+	h.fireNewHeads()
 }
 
-func (s *History) GetBlockOrder() []Sha {
-	if len(s.BlockOrder) == 0 {
-		s.recomputeBlockOrder()
+func (h *History) GetBlockOrder() []Sha {
+	if len(h.BlockOrder) == 0 {
+		h.recomputeBlockOrder()
 	}
-	return s.BlockOrder
+	return h.BlockOrder
 }
 
-func (s *History) addIncomingBlock(blk *OpBlock) error {
-	if s.hasBlock(blk.Hash) || s.hasPendingBlock(blk.Hash) {
+func (h *History) addIncomingBlock(blk *OpBlock) error {
+	if h.hasBlock(blk.Hash) || h.hasPendingBlock(blk.Hash) {
 		//fmt.Println("Already has block", blk.Hash)
 		return nil
 	}
-	prev := blk.SessionParent(s)
-	if prev.isSource() && s.Latest[blk.SessionId] != nil || !prev.isSource() && prev.SessionChild(s) != nil {
+	prev := blk.SessionParent(h)
+	if prev.isSource() && h.Latest[blk.SessionId] != nil || !prev.isSource() && prev.SessionChild(h) != nil {
 		return ErrDivergentBlock
 	}
-	s.PendingBlocks[blk.Hash] = blk
-	s.Storage.StorePendingBlock(blk)
-	blk.checkPending(s)
+	h.PendingBlocks[blk.Hash] = blk
+	h.Storage.StorePendingBlock(blk)
+	blk.checkPending(h)
 	return nil
 }
 
