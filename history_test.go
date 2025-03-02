@@ -198,7 +198,7 @@ func (t myT) repls(str1, str2 string, replacements ...string) []Replacement {
 			delete += len(r) - 1
 		case '=':
 			if delete > 0 {
-				result = append(result, Replacement{Offset: offset, Length: delete, Text: ""})
+				result = append(result, repl(offset, delete, ""))
 				delete = 0
 			}
 			before = append(before, r[1:])
@@ -206,14 +206,14 @@ func (t myT) repls(str1, str2 string, replacements ...string) []Replacement {
 			offset += len(r) - 1
 		case '+':
 			after = append(after, r[1:])
-			result = append(result, Replacement{Offset: offset, Length: delete, Text: r[1:]})
+			result = append(result, repl(offset, delete, r[1:]))
 			delete = 0
 		default:
 			t.failNow(fmt.Sprint("Bad replacement code: ", r[0]))
 		}
 	}
 	if delete > 0 {
-		result = append(result, Replacement{Offset: offset, Length: delete, Text: ""})
+		result = append(result, repl(offset, delete, ""))
 	}
 	t.testEqual(str1, strings.Join(before, ""), "Replacements do not match starting doc")
 	t.testEqual(str2, strings.Join(after, ""), "Result of replacements does not match")
@@ -302,7 +302,7 @@ func commitReplacements(t myT, p *testSession, edits []Replacement, expected []R
 	// simulate user edit
 	editDoc.Apply("edits", 0, edits)
 	editDoc.Apply("result", 0, repl)
-	fmt.Printf("EDITS\n  INPUT: %#v\n  OUTPUT: %#v\nEDIT DOC:\n%s", edits, repl, editDoc.Changes("  "))
+	p.history.Verbose("EDITS\n  INPUT: %#v\n  OUTPUT: %#v\nEDIT DOC:\n%s", edits, repl, editDoc.Changes("  "))
 	testEqual(t, editDoc.String(), expectedDoc, "replacements did not match after commit")
 
 	//p.Commit(edits, 0, 0)
@@ -343,8 +343,6 @@ func (s *testSession) Commit(repls []Replacement, selOff, selLen int) ([]Replace
 }
 
 func (s *testSession) verifyEdits() {
-	//}
-	//func (s *testSession) real_verifyEdits() {
 	blk := s.History.Latest[s.sessionId]
 	if blk == nil || len(blk.Parents) == 0 {
 		return
@@ -370,7 +368,8 @@ func (s *testSession) verifyEdits() {
 		fmt.Println("ACTUAL TREE BEFORE REPL:\n", doc.Changes("  ", prev.GetOps()))
 		fmt.Println("ACTUAL TREE:\n", doc.Changes("  ", result.GetOps()))
 		fmt.Println("EXPECTED:\n", expected, "\nGOT:\n", result)
-		os.Exit(1)
+		s.failNow("BAD EDITS")
+		//os.Exit(1)
 	} else if !sameRepls(blk.Replacements, blk.Replacements) {
 		fmt.Println("OLD REPLS: ", blk.Replacements)
 		fmt.Println("NEW REPLS: ", blk.Replacements)
@@ -475,7 +474,7 @@ func TestBasic(tt *testing.T) {
 	t.testEqual(tp.s1.doc().String(), "one\nTHREE\n", "Bad document for session1")
 	t.testEqual(tp.s2.doc().String(), "one\ntwo\n", "Bad document for session2")
 	three := "one\nFOUR\n"
-	four := "one\nFOUR\nTHREE\n"
+	four := "one\nTHREE\nFOUR\n"
 	commitReplacements(t, tp.s2,
 		t.repls(one, three, "=one\n", "-two\n", "+FOUR\n"),
 		nil,
@@ -724,7 +723,6 @@ func (s *testSession) change(newEdit, expected *edit) *document {
 	l := s.latest()
 	doc := l.GetDocument(s.history)
 	verbose(1, "EDIT: %+v\n", newEdit)
-	println("\n@@@\nERROR HERE")
 	delta := s.commit(newEdit, expected)
 	verbose(1, "Delta: %d\n", delta)
 	newDoc := s.latest().GetDocument(s.history)
@@ -763,7 +761,6 @@ func TestPeerEdits(tt *testing.T) {
 	tp := myT{tt}.newTwoSessions("emacs", "vscode", docBuf.String())
 	for i, offset := range inserts {
 		verbose(1, "Replacement: %d\n", i+1)
-		println("\n@@@\nERROR HERE")
 		tp.change(offset, 0, "a")
 	}
 }
@@ -866,11 +863,7 @@ func TestSet(tt *testing.T) {
 	testReplace := func(pos int, newText string) {
 		newOffsets(doc0, offsets)
 		copy(doc1, doc0)
-		s.Commit([]Replacement{doc.Replacement{
-			Offset: offsets[pos],
-			Length: len(doc0[pos]),
-			Text:   newText,
-		}}, -1, -1)
+		s.Commit([]Replacement{repl(offsets[pos], len(doc0[pos]), newText)}, -1, -1)
 		doc0[pos] = newText
 		latest := s.GetLatestDocument().String()
 		t.testEqual(latest, strings.Join(doc0, ""), "Replacement mismatch")
@@ -880,13 +873,18 @@ func TestSet(tt *testing.T) {
 	testReplace(1, `4`)
 }
 
+func repl(offset, length int, text string) Replacement {
+	return Replacement{Offset: offset, Length: length, Text: text}
+}
+
 func TestComplexEditing(tt *testing.T) {
+	verbosity = 2
 	t := myT{tt}
 	p1 := newTestPeer(t, "", "session1", docString0)
 	p2 := newTestPeer(t, "", "session2", docString0)
 	p3 := newTestPeer(t, "", "session3", docString0)
-	p2.Commit([]Replacement{Replacement{0, 0, "line ZERO\n"}}, -1, -1)
-	p3.Commit([]Replacement{Replacement{23, 5, "THREE"}}, -1, -1)
+	p2.Commit([]Replacement{repl(0, 0, "line ZERO\n")}, -1, -1)
+	p3.Commit([]Replacement{repl(23, 5, "THREE")}, -1, -1)
 	blk2 := outgoing(p2)
 	doc2 := p2.GetLatestDocument().String()
 	t.testEqual(doc2, `line ZERO
@@ -900,7 +898,8 @@ line two
 line THREE`, "Doc 3 is bad")
 	addBlock(t, p1, blk2, doc2)
 	addBlock(t, p1, blk3, doc3)
-	p1.Commit([]Replacement{Replacement{5, 3, "ONE"}}, -1, -1)
+	fmt.Println("\n@@@\n@@@ FINAL EDIT")
+	p1.Commit([]Replacement{repl(5, 3, "ONE")}, -1, -1)
 	doc1 := p1.GetLatestDocument().String()
 	t.testEqual(doc1, `line ZERO
 line ONE

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 
 	//"math/rand"
 	"crypto/rand"
@@ -40,7 +41,18 @@ type History struct {
 	Storage       DocStorage           // storage (optionally external)
 	LCAs          map[Twosha]*LCA      // cache of 2-block latest common ancestors
 	BlockOrder    []Sha
-	//	Heads         []*OpBlock // current DAG heads -- edits should merge these
+	Listeners     []HistoryListener
+	Verbosity     int
+	// TODO need to move to Heads instead of Latest
+	//   - currently we use Heads() which computes it from Latest
+	//   - heads should accumulate when new blocks come in
+	//   - remove ancesctors from the Heads list
+	//   - commits should merge Heads and replace them with the new block
+	//	Heads         []*OpBlock // current DAG heads -- commits should merge these
+}
+
+type HistoryListener interface {
+	NewHeads(service *History)
 }
 
 type DocStorage interface {
@@ -60,16 +72,6 @@ type DocStorage interface {
 	GetDocument(docHash Sha) string
 	StoreDocument(doc string)
 }
-
-//// temporary connection information, not persisted to storage
-//type Session struct {
-//	*History
-//	Peer      string
-//	SessionId string
-//	//SessionId  string
-//	PendingOps []Replacement
-//	Follow     string
-//}
 
 // UUIDs
 func newUUID() UUID {
@@ -428,20 +430,24 @@ func (blk *OpBlock) applyTo(doc *document) {
 	doc.Apply(id, 0, blk.Replacements)
 }
 
-// parents hashes most likely includes parent.Hash
 func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents []Sha, repl []doc.Replacement, selOff, selLen int) (*OpBlock, []doc.Replacement, error) {
 	if len(parents) == 1 && parent.Hash == parents[0] {
+		if len(repl) == 0 {
+			h.Verbose("NO EDITS TO PARENT")
+			return parent, []doc.Replacement{}, nil
+		}
+		h.Verbose("ONLY EDITS TO PARENT")
 		return newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repl, selOff, selLen), []doc.Replacement{}, nil
 	}
 	hashStrs := make([]string, len(parents))
 	for i, hash := range parents {
 		hashStrs[i] = hex.EncodeToString(hash[:])
 	}
-	//fmt.Printf("COMPUTING BLOCK\n  PARENT: %#v\n  PARENTS: %#v\n  REPLS: %#v\n",
-	//	parent.replId(),
-	//	hashStrs,
-	//	repl,
-	//)
+	h.Verbose("COMPUTING BLOCK\n  PARENT: %#v\n  PARENTS: %#v\n  REPLS: %#v\n",
+		parent.replId(),
+		hashStrs,
+		repl,
+	)
 	h.GetBlockOrder()
 	parentSet := doc.NewSet(parents...)
 	parentSet.Add(parent.Hash)
@@ -452,16 +458,16 @@ func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents 
 	// identify edits from merging
 	editId := "edit-" + parent.replId()
 	// save parentPeerDoc for later edit computation
-	//fmt.Printf("Ancestor %s\n Parent: %s\n", ancestor.replId(), parent.replId())
+	h.Verbose("Ancestor %s\n Parent: %s\n", ancestor.replId(), parent.replId())
 	peerDoc := parent.getDocumentForAncestor(h, ancestor, false)
-	//fmt.Printf("PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	h.Verbose("PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	originalIds := peerDoc.GetOps().Measure().Ids
 	original := peerDoc.Freeze()
 	original.Apply(editId, 0, repl)
 	reverse := original.ReverseEdits()
-	editorDoc := peerDoc.Copy()
+	editorDoc := original.Freeze()
 	peerDoc.Apply(editId, 0, repl)
-	originalIds := peerDoc.GetOps().Measure().Ids
-	//fmt.Printf("EDITED PARENT DOC\n%s\n", peerDoc.Changes("  "))
+	h.Verbose("EDITED PARENT DOC\n%s\n", peerDoc.Changes("  "))
 	var pdoc *doc.Document
 	// merge in other edits
 	for _, hash := range parents {
@@ -475,67 +481,45 @@ func (parent *OpBlock) computeBlock(h *History, peer, sessionId string, parents 
 			pdoc.Merge(hdoc)
 		}
 	}
-	// no alterations are needed unless merging occurred
-	editRepl := []doc.Replacement{}
-	if pdoc != nil {
-		//fmt.Printf("Merged parents:\n%s\n", pdoc.Changes("  "))
-		// mark peer's selection (if any)
-		if selOff != -1 {
-			markSelection(peerDoc, editId, selOff, selLen)
-		}
-		peerDoc.Merge(pdoc)
-		peerDoc.Simplify()
-		//fmt.Printf("FINAL DOC:\n%s\n", peerDoc.Changes("  "))
-		//fmt.Printf("REVERSE EDIT: %#v\n", reverse)
-		orepl := repl
-		// transform the replacements
-		repl, selOff, selLen = getReplsForEdits(peerDoc, editId)
-
-		editorId := "\x00edit-repl-" + parent.replId()
-		//fmt.Printf("EDITOR DOC - INITIAL\n%s", editorDoc.Changes("  "))
-		editorDoc.Apply(editorId, 0, orepl)
-		//fmt.Printf("EDITOR DOC - AFTER ORIGINAL REPL\n%s", editorDoc.Changes("  "))
-		originalIds = editorDoc.GetOps().Measure().Ids
-		editorId2 := "\x00reverse-edit-repl-" + parent.replId()
-		editorDoc.Apply(editorId2, 0, reverse)
-		//fmt.Printf("EDITOR DOC - AFTER REVERSE REPL\n%s", editorDoc.Changes("  "))
-		editorId3 := "\x00forward-edit-repl-" + parent.replId()
-		editorDoc.Apply(editorId3, 0, orepl)
-		//fmt.Printf("EDITOR DOC - AFTER FORWARD REPL\n%s", editorDoc.Changes("  "))
-		editorDoc.Merge(pdoc)
-		//fmt.Printf("EDITOR DOC - AFTER MERGE\n%s", editorDoc.Changes("  "))
-		editorDoc.Simplify()
-		//fmt.Printf("EDITOR DOC - AFTER SIMPLIFY\n%s", editorDoc.Changes("  "))
-		editRepl, _ = editorDoc.EditsFor(editorDoc.GetOps().Measure().Ids.Complement(originalIds), nil)
-		//fmt.Printf("COMPUTED REVISED EDITs\n  GIVEN: %#v\n  BLOCK: %#v\n  EDITREPL: %#v\n  REVERSE: %#v\n", orepl, repl, editRepl, reverse)
+	var editRepl []Replacement
+	h.Verbose("Merged parents:\n%s\n", pdoc.Changes("  "))
+	// mark peer's selection (if any)
+	if selOff != -1 {
+		markSelection(peerDoc, editId, selOff, selLen)
 	}
+	peerDoc.Merge(pdoc)
+	peerDoc.Simplify()
+	h.Verbose("FINAL DOC:\n%s\n", peerDoc.Changes("  "))
+	h.Verbose("REVERSE EDIT: %#v\n", reverse)
+	orepl := repl
+	// transform the replacements
+	ids := peerDoc.GetOps().Measure().Ids.Copy()
+	ids.Subtract(originalIds)
+	repl, _ = peerDoc.EditsFor(doc.NewSet(editId), nil)
+	var erepl []Replacement
+	erepl, selOff, selLen = getReplsForEdits(peerDoc, editId, ids)
+	editRepl = make([]Replacement, 0, len(reverse)+len(repl))
+	editRepl = append(editRepl, reverse...)
+	editRepl = append(editRepl, erepl...)
+	h.Verbose("COMPUTED REVISED EDITs\n  GIVEN: %#v\n  BLOCK: %#v\n  REVERSE: %#v\n  EDITREPL: %#v\n", orepl, repl, reverse, editRepl)
 	blk := newOpBlock(peer, sessionId, h.Storage.GetBlockCount(), parents, repl, selOff, selLen)
+	if blk.GetDocument(h).String() != peerDoc.String() {
+		h.Verbose("BAD DOCUMENT, EXPECTED:\n%s\nBUT GOT:\n%s\n",
+			blk.GetDocument(h).String(),
+			peerDoc.String())
+		panic("ERROR COMPUTING DOCUMENT")
+	}
+	h.Verbose("APPLY FINAL EDIT TO PEER DOC:\n%s\n", editorDoc.String())
+	editorDoc.Apply("edit", 0, editRepl)
+	h.Verbose("FINAL PEER DOC:\n%s\n", editorDoc.Changes("  "))
 	return blk, editRepl, nil
 }
 
-//func cleanRevisedRepl(orig, revised []doc.Replacement) []doc.Replacement {
-//	res := make([]doc.Replacement, 0, len(revised))
-//	oi := 0
-//	ri := 0
-//	offset := 0
-//	for oi < len(orig) {
-//		if orig[oi] == revised[ri] {
-//			offset += len(revised[ri].Text) - revised[ri].Length
-//		} else {
-//			repl := revised[ri]
-//			repl.Offset += offset
-//			res = append(res, repl)
-//		}
-//		oi++
-//		ri++
-//	}
-//}
-
-func getReplsForEdits(document *doc.Document, editId string) ([]doc.Replacement, int, int) {
+func getReplsForEdits(document *doc.Document, editId string, ids doc.Set[string]) ([]doc.Replacement, int, int) {
 	startM := selectionStart(editId)
 	endM := selectionEnd(editId)
 	markers := doc.NewSet(startM, endM)
-	result, resultMarkers := document.EditsFor(doc.NewSet(editId), markers)
+	result, resultMarkers := document.EditsFor(ids, markers)
 	resultOff := -1
 	resultLen := -1
 	if document.HasMarker(startM) {
@@ -543,62 +527,6 @@ func getReplsForEdits(document *doc.Document, editId string) ([]doc.Replacement,
 		resultLen = resultMarkers[endM] - resultOff
 	}
 	return result, resultOff, resultLen
-}
-
-// compute edits to reconstruct merged document for a block
-// this is for when the peer just committed the replacements, so
-// it's document state is prevBlock + replacements. Compute the
-// edits necessary to transform it to the merged document.
-func (blk *OpBlock) old_edits(h *History, selOff, selLen int) ([]Replacement, int, int) {
-	// to get to the merged doc from peer's current doc:
-	// reverse(parent->current)
-	// + reverse(ancestor -> parent)
-	// + get ancestor -> merged
-	h.GetBlockOrder()
-	parent := blk.SessionParent(h)
-	parents := blk.Parents
-	if parent == h.Source {
-		parents = make([]Sha, 0, len(parents)+1)
-		parents = append(make([]Sha, 0, len(parents)+1), blk.Parents...)
-		parents = append(parents, h.Source.Hash)
-	}
-	ancestor := blk.getDocumentAncestor(h)
-	if parent.order < ancestor.order {
-		ancestor = parent
-	}
-	// start at parent and apply replacements to produce current session's doc
-	parentToCurrent := parent.GetDocument(h)
-	blk.applyTo(parentToCurrent)
-	// snapshot current session's document
-	peerDoc := parentToCurrent.Freeze()
-
-	// if there's a selection, add markers to the current session's document
-	//if blk.SelectionOffset != -1 {
-	if selOff != -1 {
-		//markSelection(peerDoc, blk.SessionId, blk.SelectionOffset, blk.SelectionLength)
-		markSelection(peerDoc, blk.SessionId, selOff, selLen)
-		so, sl := getSelection(peerDoc, blk.SessionId)
-		//if so != blk.SelectionOffset || sl != blk.SelectionLength {
-		if so != selOff || sl != selLen {
-			println("DOCUMENT\n", peerDoc.Changes("  "))
-			//panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", blk.SelectionOffset, blk.SelectionLength, so, sl))
-			panic(fmt.Sprintf("BAD SELECTION, EXPECTED %d LEN %d BUT GOT %d LEN %d", selOff, selLen, so, sl))
-		}
-	}
-	//fmt.Printf("STARTING-PEER-DOC:\n%s\n", peerDoc.Changes("  "))
-	// make an editor object to help track changes
-	e := editor{peerDoc, blk.replId(), 0}
-	// reverse session's edits to move selection back to parent
-	e.Apply(parentToCurrent.ReverseEdits())
-	if ancestor.Hash != parent.Hash {
-		ancestorToParent := parent.getDocumentForAncestor(h, ancestor, false)
-		e.Apply(ancestorToParent.ReverseEdits())
-	}
-	ancestorToMerged := blk.getDocumentForAncestor(h, ancestor, true)
-	e.Apply(ancestorToMerged.Edits())
-	offset, length := getSelection(peerDoc, blk.SessionId)
-	peerDoc.Simplify()
-	return peerDoc.Edits(), offset, length
 }
 
 type editor struct {
@@ -647,6 +575,30 @@ func NewHistory(storage DocStorage, text string) *History {
 	return s
 }
 
+func (s *History) Verbose(format string, args ...any) { s.VerboseN(1, format, args...) }
+
+func (s *History) VerboseN(level int, format string, args ...any) {
+	if level <= s.Verbosity {
+		if format[len(format)-1] != '\n' {
+			format += "\n"
+		}
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+}
+
+func (s *History) AddListener(l HistoryListener) {
+	if s.Listeners == nil {
+		s.Listeners = make([]HistoryListener, 0, 8)
+	}
+	s.Listeners = append(s.Listeners, l)
+}
+
+func (s *History) fireNewHeads() {
+	for _, l := range s.Listeners {
+		l.NewHeads(s)
+	}
+}
+
 func (s *History) LatestBlock(sessionId string) *OpBlock {
 	blk := s.Latest[sessionId]
 	if blk == nil {
@@ -660,7 +612,7 @@ func (s *History) GetDocument(hash Sha) string {
 }
 
 func (s *History) GetLatestDocument() *document {
-	latest := s.LatestHashes()
+	latest := s.Heads()
 	ancestor := s.lca(latest)
 	return s.GetDocumentForBlocks(ancestor, latest)
 }
@@ -814,20 +766,6 @@ func sortHashes(hashes []Sha) {
 	})
 }
 
-// sorted hashes of the most recent blocks in the known chains
-func (s *History) LatestHashes() []Sha {
-	if len(s.Latest) == 0 {
-		return []Sha{s.Source.Hash}
-	}
-	hashSet := doc.NewSet[Sha]()
-	for _, blk := range s.Latest {
-		hashSet.Add(blk.Hash)
-	}
-	hashes := hashSet.ToSlice()
-	sortHashes(hashes)
-	return hashes
-}
-
 func (s *History) addBlock(blk *OpBlock) {
 	if len(blk.Parents) == 0 {
 		panic("Adding block with not parents")
@@ -855,6 +793,7 @@ func (s *History) addBlock(blk *OpBlock) {
 	}
 	// none of the parents had order == len(s.blocks)-1
 	s.BlockOrder = s.BlockOrder[:0]
+	s.fireNewHeads()
 }
 
 func (s *History) GetBlockOrder() []Sha {
@@ -879,6 +818,18 @@ func (s *History) addIncomingBlock(blk *OpBlock) error {
 	return nil
 }
 
+func SameHashesNoExclude(a, b []Sha) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, hashA := range a {
+		if bytes.Compare(hashA[:], b[i][:]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func SameHashes(a, b []Sha, exclude Sha) bool {
 	if len(a) != len(b)+1 {
 		return false
@@ -898,6 +849,50 @@ func SameHashes(a, b []Sha, exclude Sha) bool {
 	return true
 }
 
+func (h *History) isAncestor(bl1, bl2 *OpBlock) bool {
+	if bl1.order > bl2.order {
+		return false
+	}
+	h2 := bl2.Hash[:]
+	for _, ch := range bl1.children {
+		if bytes.Compare(ch[:], h2) == 0 {
+			return true
+		} else if h.isAncestor(h.GetBlock(ch), bl2) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *History) Heads() []Sha {
+	if len(h.Latest) == 0 {
+		return []Sha{h.Source.Hash}
+	}
+	blocks := make([]*OpBlock, 0, len(h.Latest))
+	for _, blk := range h.Latest {
+		blocks = append(blocks, blk)
+	}
+	h.GetBlockOrder()
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].order < blocks[j].order
+	})
+	chosen := doc.NewSet(blocks...)
+	for i, block := range blocks {
+		for j := i + 1; j < len(blocks); j++ {
+			if h.isAncestor(block, blocks[j]) {
+				chosen.Remove(block)
+				break
+			}
+		}
+	}
+	result := make([]Sha, 0, len(chosen))
+	for c := range chosen {
+		result = append(result, c.Hash)
+	}
+	sortHashes(result)
+	return result
+}
+
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
 func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int, selLen int) ([]Replacement, int, int, error) {
@@ -906,52 +901,25 @@ func (h *History) Commit(peer, sessionId string, repls []Replacement, selOff int
 		parent = h.Source
 		h.Latest[sessionId] = parent
 	}
-	latestHashes := h.LatestHashes()
+	latestHashes := h.Heads()
 	if len(repls) == 0 {
 		if (parent == nil && len(h.Latest) == 0) || parent != nil && SameHashes(latestHashes, parent.Parents, parent.Hash) {
 			// no changes
+			h.Verbose("NO CHANGES")
 			return []Replacement{}, selOff, selLen, nil
 		}
 	}
-	excluded := doc.Set[Sha]{}
-	for i, p := range latestHashes {
-		if !excluded.Has(p) {
-			par := h.GetBlock(p)
-			for _, c := range latestHashes[i+1:] {
-				if !excluded.Has(c) {
-					child := h.GetBlock(c)
-					if child.descendants.Has(p) {
-						excluded.Add(c)
-					} else if par.descendants.Has(c) {
-						excluded.Add(p)
-					}
-				}
-			}
-		}
-	}
-	parents := make([]Sha, 0, len(latestHashes)-len(excluded))
-	for _, p := range latestHashes {
-		if !excluded.Has(p) {
-			parents = append(parents, p)
-		}
-	}
-	if len(repls) == 0 && parent != nil {
-		grandSet := doc.NewSet(parent.Parents...)
-		parentSet := doc.NewSet(parents...)
-		parentSet.Remove(parent.Hash)
-		parentSet.Subtract(grandSet)
-		if len(parentSet) == 0 {
-			// no changes
-			return []Replacement{}, selOff, selLen, nil
-		}
-	}
-	sortHashes(parents)
+	parents := h.Heads()
 	blk, edits, err := parent.computeBlock(h, peer, sessionId, parents, repls, selOff, selLen)
 	if err != nil {
 		return nil, 0, 0, err
+	} else if blk == parent {
+		h.Verbose("NO EDITS")
+		return nil, 0, 0, nil
 	}
-	fmt.Printf("EDITED, REPL: %#v\n", edits)
+	h.Verbose("EDITED, REPL: %#v\n", edits)
 	h.addBlock(blk)
+	h.fireNewHeads()
 	return edits, blk.SelectionOffset, blk.SelectionLength, nil
 }
 
